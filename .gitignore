@@ -1,0 +1,10 @@
+# Real secrets — never uploaded
+.env
+
+# Python's own generated files
+__pycache__/
+*.pyc
+.venv/
+
+# Mac's invisible folder-view file
+.DS_Store
