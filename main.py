@@ -616,6 +616,8 @@ def status_page():
           const playCtx = new (window.AudioContext || window.webkitAudioContext)({{ sampleRate: 24000 }});
           state.playCtx = playCtx;
 
+          state.scheduledSources = [];
+
           function playAudioChunk(int16Array) {{
             const float32 = new Float32Array(int16Array.length);
             for (let i = 0; i < int16Array.length; i++) float32[i] = int16Array[i] / 0x8000;
@@ -627,6 +629,24 @@ def status_page():
             const startAt = Math.max(playCtx.currentTime, state.playHead);
             src.start(startAt);
             state.playHead = startAt + buffer.duration;
+            state.scheduledSources.push(src);
+            src.onended = () => {{
+              const i = state.scheduledSources.indexOf(src);
+              if (i !== -1) state.scheduledSources.splice(i, 1);
+            }};
+          }}
+
+          // Per Google's own docs: on an interruption, the client must
+          // stop playback and clear queued audio itself -- the server
+          // just tells you it happened, it doesn't silence your
+          // speakers for you. Without this, Gemini's old (cut-off)
+          // reply keeps playing over whatever you just said.
+          function stopQueuedAudioForInterruption() {{
+            for (const src of state.scheduledSources) {{
+              try {{ src.stop(); }} catch (e) {{}}
+            }}
+            state.scheduledSources = [];
+            state.playHead = playCtx.currentTime;
           }}
 
           try {{
@@ -649,6 +669,11 @@ def status_page():
                 onmessage: (message) => {{
                   const content = message.serverContent;
                   if (!content) return;
+                  if (content.interrupted) {{
+                    stopQueuedAudioForInterruption();
+                    state.geminiText += ' [interrupted]';
+                    render();
+                  }}
                   if (content.inputTranscription && content.inputTranscription.text) {{
                     state.youText += content.inputTranscription.text;
                     render();
