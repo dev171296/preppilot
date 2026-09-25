@@ -56,10 +56,12 @@ is a separate, still-valid plan — this only affects this one backend
 smoke test.
 """
 
+import asyncio
 import os
 import subprocess
 import time
 
+import websockets
 from openai import OpenAI
 from google import genai
 
@@ -241,6 +243,18 @@ STT_PROVIDERS = {
         "models": ["parakeet-ctc-0.6b-asr"],
         "kind": "nvidia_stt",
     },
+    "deepgram_nova3": {
+        "label": "Deepgram (Nova-3, live streaming + Hinglish)",
+        "models": ["nova-3"],
+        "kind": "deepgram_stream",
+        # Not run through run_stt_test()/a plain POST like the two
+        # above -- it's a genuine persistent WebSocket relay (see
+        # stream_deepgram_stt below), because Deepgram's API actually
+        # supports true continuous streaming, unlike Groq/NVIDIA's
+        # batch-only endpoints. The /status page gives this row a
+        # different button ("Live Listen") for that reason.
+        "live_stream": True,
+    },
 }
 
 STT_TEST_PHRASE = "PrepPilot is testing speech recognition."
@@ -292,8 +306,8 @@ def _to_wav16k_bytes(audio_bytes: bytes) -> bytes:
 # English-only -- picking Hindi for it may just fail; that's a real
 # answer from NVIDIA, not something to hide.
 STT_LANGUAGES = {
-    "en": {"label": "English", "whisper": "en", "riva": "en-US"},
-    "hi": {"label": "Hindi", "whisper": "hi", "riva": "hi-IN"},
+    "en": {"label": "English", "whisper": "en", "riva": "en-US", "deepgram": "en"},
+    "hi": {"label": "Hindi", "whisper": "hi", "riva": "hi-IN", "deepgram": "multi"},
 }
 DEFAULT_STT_LANGUAGE = "en"
 
@@ -419,3 +433,66 @@ def run_realtime_test(provider_key: str) -> dict:
     if provider is None:
         return {"ok": False, "error": f"Unknown realtime provider '{provider_key}'"}
     return {"ok": False, "planned": True, "error": provider["note"]}
+
+
+# ---------------------------------------------------------------------------
+# Deepgram live streaming relay
+# ---------------------------------------------------------------------------
+# This is genuinely different from run_stt_test() above: Deepgram's API
+# supports a real, continuous streaming connection (raw audio flows in,
+# interim + final transcripts flow back, the whole time), so instead of
+# chopping the mic into independent ~2.5s clips and POSTing each one, we
+# open one WebSocket to the browser and one to Deepgram and relay bytes
+# straight through in both directions for as long as "Listen" is on.
+DEEPGRAM_MODEL = "nova-3"
+
+
+async def stream_deepgram_stt(browser_ws, language: str | None = None) -> None:
+    """
+    Relays raw 16kHz mono PCM16 audio from the browser (browser_ws, a
+    FastAPI WebSocket already accept()-ed by the caller) straight
+    through to Deepgram's live streaming endpoint, and relays
+    Deepgram's JSON transcript messages straight back -- unmodified,
+    so the browser sees the same is_final/channel.alternatives shape
+    the sample script parses with jq.
+
+    "language" is one of STT_LANGUAGES's keys. For Hindi we pass
+    Deepgram's "multi" code rather than "hi" -- that's the setting
+    Deepgram itself recommends for Hindi/English code-switched
+    (Hinglish) speech, not a plain single-language Hindi mode.
+    """
+    lang = STT_LANGUAGES.get(language, STT_LANGUAGES[DEFAULT_STT_LANGUAGE])
+    dg_language = lang.get("deepgram", "en")
+    api_key = os.environ["DEEPGRAM_API_KEY"]
+
+    url = (
+        "wss://api.deepgram.com/v1/listen"
+        f"?encoding=linear16&sample_rate=16000&model={DEEPGRAM_MODEL}"
+        f"&language={dg_language}&interim_results=true&endpointing=300"
+    )
+
+    async with websockets.connect(
+        url, additional_headers={"Authorization": f"Token {api_key}"}
+    ) as dg_ws:
+
+        async def browser_to_deepgram():
+            try:
+                while True:
+                    chunk = await browser_ws.receive_bytes()
+                    await dg_ws.send(chunk)
+            except Exception:
+                pass
+            finally:
+                try:
+                    await dg_ws.send('{"type": "CloseStream"}')
+                except Exception:
+                    pass
+
+        async def deepgram_to_browser():
+            try:
+                async for message in dg_ws:
+                    await browser_ws.send_text(message)
+            except Exception:
+                pass
+
+        await asyncio.gather(browser_to_deepgram(), deepgram_to_browser())

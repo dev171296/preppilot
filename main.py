@@ -6,7 +6,7 @@ waits for requests and sends back answers. Every "@app.get(...)" or
 "@app.post(...)" line below is one address the service understands.
 """
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from providers import (
     PROVIDERS,
@@ -16,6 +16,7 @@ from providers import (
     run_test,
     run_stt_test,
     run_realtime_test,
+    stream_deepgram_stt,
 )
 
 app = FastAPI(title="PrepPilot API")
@@ -78,6 +79,38 @@ async def api_test_stt_provider(
     )
 
 
+@app.websocket("/ws/stt-stream/{provider_key}")
+async def ws_stt_stream(websocket: WebSocket, provider_key: str, language: str | None = None):
+    """
+    A real, persistent streaming connection: the browser keeps this
+    open for as long as "Live Listen" is on and pushes raw audio
+    continuously; we relay it straight through to the provider (right
+    now, only Deepgram supports this) and relay its transcript
+    messages straight back. Unlike /api/stt-test above, there's no
+    single request/response here -- the connection just stays open.
+    """
+    await websocket.accept()
+    try:
+        if provider_key == "deepgram_nova3":
+            await stream_deepgram_stt(websocket, language)
+        else:
+            await websocket.send_text(
+                '{"error": "No live-stream relay wired up for this provider"}'
+            )
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_text(f'{{"error": "{type(e).__name__}: {e}"}}')
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @app.post("/api/realtime-test/{provider_key}")
 def api_test_realtime_provider(provider_key: str):
     """
@@ -129,8 +162,13 @@ def status_page():
         )
 
     def stt_rows():
-        return "".join(
-            f"""
+        rows = []
+        for key, p in STT_PROVIDERS.items():
+            if p.get("live_stream"):
+                button = f"""<button id="rec-btn-stt-{key}" onclick="toggleLiveStream('stt-{key}', '{key}')">🎙️ Live Listen</button>"""
+            else:
+                button = f"""<button id="rec-btn-stt-{key}" onclick="toggleListen('stt-{key}', '{key}')">🎤 Listen</button>"""
+            rows.append(f"""
             <tr id="row-stt-{key}">
               <td>{p['label']}</td>
               <td>
@@ -141,11 +179,10 @@ def status_page():
               <td class="ttft">—</td>
               <td class="total">—</td>
               <td class="reply">—</td>
-              <td><button id="rec-btn-stt-{key}" onclick="toggleListen('stt-{key}', '{key}')">🎤 Listen</button></td>
+              <td>{button}</td>
             </tr>
-            """
-            for key, p in STT_PROVIDERS.items()
-        )
+            """)
+        return "".join(rows)
 
     def realtime_rows():
         return "".join(
@@ -192,7 +229,7 @@ def status_page():
       </table>
 
       <h3>Speech-to-text (STT)</h3>
-      <p style="font-size:13px;color:#555">Pick the language you'll speak (auto-detect on 2.5s chunks is unreliable, especially Hindi/Urdu), click Listen and just talk -- your mic streams in short chunks that get transcribed live and appended below as you speak. Click Stop when done. (Neither provider's API is truly continuous-streaming from a plain HTTP call, so this is near-real-time in ~2.5s chunks, not word-by-word.)</p>
+      <p style="font-size:13px;color:#555">Pick the language you'll speak, then click Listen (Groq/NVIDIA -- near-real-time in ~2.5s chunks, since their APIs are batch-only) or Live Listen (Deepgram -- a real continuous stream, word-by-word, with interim results shown in <em>italics</em> before they're finalized). Click Stop when done.</p>
       <table>
         <tr>
           <th>Provider</th><th>Model</th><th>Status</th>
@@ -354,6 +391,142 @@ def status_page():
           row.querySelector('.status').textContent = 'listening...';
           row.querySelector('.reply').textContent = '(listening...)';
           listenLoop(rowKey, providerKey);
+        }}
+        // ---- Deepgram: true live streaming over a WebSocket ----
+        // (as opposed to toggleListen()/listenLoop() above, which
+        // re-POSTs independent ~2.5s clips to Groq/NVIDIA's batch
+        // APIs -- Deepgram's API supports a real continuous stream,
+        // so this one keeps a single connection open and pushes raw
+        // audio the whole time "Live Listen" is on.)
+        const liveStreamState = {{}};
+
+        function downsampleTo16kPCM16(float32Samples, inputSampleRate) {{
+          const ratio = inputSampleRate / 16000;
+          const outLength = Math.floor(float32Samples.length / ratio);
+          const pcm16 = new Int16Array(outLength);
+          for (let i = 0; i < outLength; i++) {{
+            const srcIndex = Math.floor(i * ratio);
+            let s = Math.max(-1, Math.min(1, float32Samples[srcIndex]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }}
+          return pcm16;
+        }}
+
+        async function toggleLiveStream(rowKey, providerKey) {{
+          const row = document.getElementById('row-' + rowKey);
+          const btn = document.getElementById('rec-btn-' + rowKey);
+          const existing = liveStreamState[rowKey];
+
+          if (existing) {{
+            existing.stopping = true;
+            try {{ existing.ws.close(); }} catch (e) {{}}
+            try {{ existing.processor.disconnect(); }} catch (e) {{}}
+            try {{ existing.source.disconnect(); }} catch (e) {{}}
+            try {{ existing.audioCtx.close(); }} catch (e) {{}}
+            try {{ existing.stream.getTracks().forEach((t) => t.stop()); }} catch (e) {{}}
+            delete liveStreamState[rowKey];
+            btn.textContent = '🎙️ Live Listen';
+            row.querySelector('.status').textContent = 'OK';
+            row.querySelector('.status').className = 'status ok';
+            return;
+          }}
+
+          let stream;
+          try {{
+            stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+          }} catch (err) {{
+            row.querySelector('.status').textContent = 'FAILED';
+            row.querySelector('.status').className = 'status fail';
+            row.querySelector('.reply').textContent = 'Mic error: ' + err.message;
+            return;
+          }}
+
+          const langSelect = document.getElementById('lang-' + rowKey);
+          const language = langSelect ? langSelect.value : 'en';
+          const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const ws = new WebSocket(
+            `${{wsProtocol}}//${{window.location.host}}/ws/stt-stream/${{providerKey}}?language=${{encodeURIComponent(language)}}`
+          );
+          ws.binaryType = 'arraybuffer';
+
+          const state = {{ ws, stream, stopping: false, finalText: '', interimText: '' }};
+          liveStreamState[rowKey] = state;
+
+          function render() {{
+            const parts = [];
+            if (state.finalText) parts.push(state.finalText);
+            if (state.interimText) parts.push(`<em>${{state.interimText}}</em>`);
+            row.querySelector('.reply').innerHTML = parts.length ? parts.join(' ') : '(listening...)';
+          }}
+
+          ws.onmessage = (event) => {{
+            let data;
+            try {{
+              data = JSON.parse(event.data);
+            }} catch (e) {{
+              return;
+            }}
+            if (data.error) {{
+              row.querySelector('.status').textContent = 'FAILED';
+              row.querySelector('.status').className = 'status fail';
+              row.querySelector('.reply').textContent = data.error;
+              return;
+            }}
+            const alt = data.channel && data.channel.alternatives && data.channel.alternatives[0];
+            const transcript = alt ? alt.transcript : '';
+            if (!transcript) return;
+            if (data.is_final) {{
+              state.finalText += (state.finalText ? ' ' : '') + transcript;
+              state.interimText = '';
+            }} else {{
+              state.interimText = transcript;
+            }}
+            render();
+          }};
+
+          ws.onerror = () => {{
+            if (!state.stopping) {{
+              row.querySelector('.status').textContent = 'FAILED';
+              row.querySelector('.status').className = 'status fail';
+              row.querySelector('.reply').textContent = 'Live-stream connection error.';
+            }}
+          }};
+
+          ws.onopen = async () => {{
+            btn.textContent = '⏹ Stop';
+            row.querySelector('.status').textContent = 'listening (live)...';
+            row.querySelector('.reply').textContent = '(listening...)';
+
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioCtx.createMediaStreamSource(stream);
+            const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+            state.audioCtx = audioCtx;
+            state.source = source;
+            state.processor = processor;
+
+            processor.onaudioprocess = (e) => {{
+              if (ws.readyState !== WebSocket.OPEN) return;
+              const input = e.inputBuffer.getChannelData(0);
+              const pcm16 = downsampleTo16kPCM16(input, audioCtx.sampleRate);
+              ws.send(pcm16.buffer);
+            }};
+
+            source.connect(processor);
+            processor.connect(audioCtx.destination);
+          }};
+
+          ws.onclose = () => {{
+            if (liveStreamState[rowKey] === state) {{
+              try {{ state.processor && state.processor.disconnect(); }} catch (e) {{}}
+              try {{ state.source && state.source.disconnect(); }} catch (e) {{}}
+              try {{ state.audioCtx && state.audioCtx.close(); }} catch (e) {{}}
+              try {{ state.stream.getTracks().forEach((t) => t.stop()); }} catch (e) {{}}
+              delete liveStreamState[rowKey];
+              btn.textContent = '🎙️ Live Listen';
+              row.querySelector('.status').textContent = 'OK';
+              row.querySelector('.status').className = 'status ok';
+            }}
+          }};
         }}
       </script>
     </body>
