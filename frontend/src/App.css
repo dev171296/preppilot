@@ -1,0 +1,44 @@
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid #1e293b;
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: #f8fafc;
+}
+
+.top-bar nav {
+  display: flex;
+  gap: 1.25rem;
+}
+
+.top-bar nav a {
+  color: #94a3b8;
+  text-decoration: none;
+  font-size: 0.95rem;
+}
+
+.top-bar nav a.active {
+  color: #f8fafc;
+  font-weight: 600;
+}
+
+.page-content {
+  flex: 1;
+  padding: 2rem 1.5rem;
+  max-width: 640px;
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
