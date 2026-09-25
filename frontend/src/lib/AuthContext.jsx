@@ -8,10 +8,10 @@ import { supabase } from '../lib/supabaseClient.js'
  * - `session` is Supabase's own object for "is someone logged in and
  *   with which token" — null when logged out.
  * - `profile` is OUR row from the `profiles` table for that person
- *   (headline, summary, and importantly `disclaimer_accepted_at`).
- *   It's kept separate from `session` because `session` is about
- *   authentication (proving who you are) and `profile` is about our
- *   own app data about that person.
+ *   (headline, summary, target role/company, resume file path, and
+ *   `disclaimer_accepted_at`). It's kept separate from `session`
+ *   because `session` is about authentication (proving who you are)
+ *   and `profile` is about our own app data about that person.
  */
 const AuthContext = createContext(undefined)
 
@@ -27,7 +27,7 @@ export function AuthProvider({ children }) {
     }
     const { data, error } = await supabase
       .from('profiles')
-      .select('id, headline, summary, disclaimer_accepted_at, created_at')
+      .select('id, headline, summary, target_role, target_company, resume_path, disclaimer_accepted_at, created_at')
       .eq('id', userId)
       .maybeSingle()
     if (error) {

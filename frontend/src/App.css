@@ -57,7 +57,7 @@
   display: flex;
   flex-direction: column;
   gap: 0.9rem;
-  max-width: 320px;
+  max-width: 420px;
   margin-bottom: 0.75rem;
 }
 
@@ -69,13 +69,16 @@
   color: #cbd5e1;
 }
 
-.auth-form input {
+.auth-form input,
+.auth-form textarea {
   padding: 0.5rem 0.6rem;
   border-radius: 6px;
   border: 1px solid #334155;
   background: #1e293b;
   color: #f8fafc;
   font-size: 0.95rem;
+  font-family: inherit;
+  resize: vertical;
 }
 
 .auth-form button[type='submit'] {
