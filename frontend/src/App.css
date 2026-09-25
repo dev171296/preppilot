@@ -20,6 +20,7 @@
 
 .top-bar nav {
   display: flex;
+  align-items: center;
   gap: 1.25rem;
 }
 
@@ -41,4 +42,81 @@
   margin: 0 auto;
   width: 100%;
   box-sizing: border-box;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  color: #60a5fa;
+  padding: 0;
+  font-size: inherit;
+  cursor: pointer;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  max-width: 320px;
+  margin-bottom: 0.75rem;
+}
+
+.auth-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+  color: #cbd5e1;
+}
+
+.auth-form input {
+  padding: 0.5rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #f8fafc;
+  font-size: 0.95rem;
+}
+
+.auth-form button[type='submit'] {
+  margin-top: 0.25rem;
+}
+
+button {
+  padding: 0.55rem 1rem;
+  border-radius: 6px;
+  border: 1px solid #3b82f6;
+  background: #3b82f6;
+  color: white;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.form-error {
+  color: #f87171;
+  font-size: 0.9rem;
+}
+
+.form-info {
+  color: #4ade80;
+  font-size: 0.9rem;
+}
+
+.disclaimer-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin: 1rem 0;
+  font-size: 0.95rem;
+}
+
+.disclaimer-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
 }
