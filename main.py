@@ -231,7 +231,7 @@ def status_page():
           renderResult(row, data);
         }}
 
-        // rowKey -> { stream, listening: bool, transcript: string } for
+        // rowKey -> {{ stream, listening: bool, transcript: string }} for
         // whichever STT rows are currently in "Listen" mode.
         const listenState = {{}};
         const CHUNK_MS = 2500;
