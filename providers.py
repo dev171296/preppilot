@@ -57,6 +57,7 @@ smoke test.
 """
 
 import os
+import subprocess
 import time
 
 from openai import OpenAI
@@ -241,9 +242,10 @@ STT_PROVIDERS = {
 
 STT_TEST_PHRASE = "PrepPilot is testing speech recognition."
 
-# Pre-recorded once, offline, with espeak-ng — 16kHz mono WAV, which is
-# also exactly the format NVIDIA's Riva ASR expects, so no on-the-fly
-# conversion step is needed any more either.
+# Fallback audio if the browser mic isn't used (e.g. a quick backend
+# smoke test with no recording attached) — pre-recorded once, offline,
+# with espeak-ng. 16kHz mono WAV, which is also exactly the format
+# NVIDIA's Riva ASR expects.
 STT_TEST_AUDIO_PATH = os.path.join(
     os.path.dirname(__file__), "assets", "stt_test_phrase.wav"
 )
@@ -256,9 +258,42 @@ STT_TEST_AUDIO_PATH = os.path.join(
 # https://build.nvidia.com/nvidia/parakeet-ctc-0_6b-asr/api for the
 # current one before assuming the key is bad.
 NVIDIA_ASR_FUNCTION_ID = "d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965"
+NVIDIA_ASR_SAMPLE_RATE_HZ = 16000
 
 
-def run_stt_test(provider_key: str, model: str | None = None) -> dict:
+def _to_wav16k_bytes(audio_bytes: bytes) -> bytes:
+    """
+    Converts whatever audio format the browser's mic recording came in
+    (webm/opus, ogg, etc) into 16kHz mono WAV -- the exact format
+    NVIDIA's Riva ASR expects. Works fine on an already-16k WAV too
+    (ffmpeg just passes it through), so we always run mic audio and
+    the static fallback file through this the same way.
+    """
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1"],
+        input=audio_bytes,
+        capture_output=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def run_stt_test(
+    provider_key: str,
+    model: str | None = None,
+    audio_bytes: bytes | None = None,
+    filename: str | None = None,
+) -> dict:
+    """
+    "audio_bytes" is the actual recording from the /status page's mic
+    button (whatever format the browser's MediaRecorder produced --
+    usually webm/opus). If it's missing (e.g. called without a
+    recording attached), we fall back to the pre-recorded static
+    phrase so this still works as a plain connectivity smoke test.
+    When testing a real mic recording, "expected" is left out of the
+    result since we don't know in advance what was said -- you just
+    eyeball whether the transcript looks right.
+    """
     provider = STT_PROVIDERS.get(provider_key)
     if provider is None:
         return {"ok": False, "error": f"Unknown STT provider '{provider_key}'"}
@@ -266,11 +301,17 @@ def run_stt_test(provider_key: str, model: str | None = None) -> dict:
     chosen_model = model if model in provider["models"] else provider["models"][0]
     started = time.monotonic()
     try:
-        if not os.path.exists(STT_TEST_AUDIO_PATH):
-            return {
-                "ok": False,
-                "error": f"Missing test audio file at {STT_TEST_AUDIO_PATH}",
-            }
+        expected = None
+        if audio_bytes is None:
+            if not os.path.exists(STT_TEST_AUDIO_PATH):
+                return {
+                    "ok": False,
+                    "error": f"Missing test audio file at {STT_TEST_AUDIO_PATH}",
+                }
+            with open(STT_TEST_AUDIO_PATH, "rb") as f:
+                audio_bytes = f.read()
+            filename = filename or "stt_test_phrase.wav"
+            expected = STT_TEST_PHRASE
 
         if provider["kind"] == "groq_stt":
             client = OpenAI(
@@ -278,17 +319,16 @@ def run_stt_test(provider_key: str, model: str | None = None) -> dict:
                 base_url="https://api.groq.com/openai/v1",
                 timeout=REQUEST_TIMEOUT_S,
             )
-            with open(STT_TEST_AUDIO_PATH, "rb") as f:
-                result = client.audio.transcriptions.create(
-                    model=chosen_model, file=f
-                )
+            result = client.audio.transcriptions.create(
+                model=chosen_model,
+                file=(filename or "recording.webm", audio_bytes),
+            )
             text = result.text
 
         elif provider["kind"] == "nvidia_stt":
             import riva.client  # nvidia-riva-client package
 
-            with open(STT_TEST_AUDIO_PATH, "rb") as f:
-                audio_bytes = f.read()
+            wav_bytes = _to_wav16k_bytes(audio_bytes)
 
             auth = riva.client.Auth(
                 uri="grpc.nvcf.nvidia.com:443",
@@ -300,9 +340,11 @@ def run_stt_test(provider_key: str, model: str | None = None) -> dict:
             )
             asr_service = riva.client.ASRService(auth)
             config = riva.client.RecognitionConfig(
-                language_code="en-US", max_alternatives=1
+                language_code="en-US",
+                max_alternatives=1,
+                sample_rate_hertz=NVIDIA_ASR_SAMPLE_RATE_HZ,
             )
-            response = asr_service.offline_recognize(audio_bytes, config)
+            response = asr_service.offline_recognize(wav_bytes, config)
             text = (
                 response.results[0].alternatives[0].transcript
                 if response.results
@@ -318,7 +360,7 @@ def run_stt_test(provider_key: str, model: str | None = None) -> dict:
             "model": chosen_model,
             "total_ms": round((finished - started) * 1000),
             "text": text.strip(),
-            "expected": STT_TEST_PHRASE,
+            "expected": expected,
         }
 
     except Exception as e:
