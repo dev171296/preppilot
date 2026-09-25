@@ -122,7 +122,7 @@ def status_page():
               <td class="ttft">—</td>
               <td class="total">—</td>
               <td class="reply">—</td>
-              <td><button id="rec-btn-stt-{key}" onclick="toggleRecord('stt-{key}', '{key}')">🎤 Record</button></td>
+              <td><button id="rec-btn-stt-{key}" onclick="toggleListen('stt-{key}', '{key}')">🎤 Listen</button></td>
             </tr>
             """
             for key, p in STT_PROVIDERS.items()
@@ -173,7 +173,7 @@ def status_page():
       </table>
 
       <h3>Speech-to-text (STT)</h3>
-      <p style="font-size:13px;color:#555">Click Record, say something, click Stop -- your voice gets uploaded and transcribed by that provider so you can eyeball whether it heard you right.</p>
+      <p style="font-size:13px;color:#555">Click Listen and just talk -- your mic streams in short chunks that get transcribed live and appended below as you speak. Click Stop when done. (Neither provider's API is truly continuous-streaming from a plain HTTP call, so this is near-real-time in ~2.5s chunks, not word-by-word.)</p>
       <table>
         <tr>
           <th>Provider</th><th>Model</th><th>Status</th>
@@ -231,17 +231,75 @@ def status_page():
           renderResult(row, data);
         }}
 
-        // rowKey -> { recorder, stream } for whichever STT row is
-        // currently mid-recording.
-        const activeRecordings = {{}};
+        // rowKey -> { stream, listening: bool, transcript: string } for
+        // whichever STT rows are currently in "Listen" mode.
+        const listenState = {{}};
+        const CHUNK_MS = 2500;
 
-        async function toggleRecord(rowKey, providerKey) {{
+        function recordOneChunk(stream) {{
+          return new Promise((resolve) => {{
+            const recorder = new MediaRecorder(stream);
+            const chunks = [];
+            recorder.ondataavailable = (e) => {{ if (e.data.size > 0) chunks.push(e.data); }};
+            recorder.onstop = () => resolve(new Blob(chunks, {{ type: 'audio/webm' }}));
+            recorder.start();
+            setTimeout(() => {{
+              if (recorder.state !== 'inactive') recorder.stop();
+            }}, CHUNK_MS);
+          }});
+        }}
+
+        async function transcribeChunk(rowKey, providerKey, blob) {{
+          const select = document.getElementById('model-' + rowKey);
+          let url = '/api/stt-test/' + providerKey;
+          if (select) {{
+            url += '?model=' + encodeURIComponent(select.value);
+          }}
+          const formData = new FormData();
+          formData.append('audio', blob, 'chunk.webm');
+          const res = await fetch(url, {{ method: 'POST', body: formData }});
+          return res.json();
+        }}
+
+        async function listenLoop(rowKey, providerKey) {{
+          const row = document.getElementById('row-' + rowKey);
+          const state = listenState[rowKey];
+          while (state && state.listening) {{
+            const blob = await recordOneChunk(state.stream);
+            if (!state.listening) break;
+            let data;
+            try {{
+              data = await transcribeChunk(rowKey, providerKey, blob);
+            }} catch (err) {{
+              data = {{ ok: false, error: 'Upload error: ' + err.message }};
+            }}
+            if (!state.listening) break;
+            if (data.ok && data.text) {{
+              state.transcript += (state.transcript ? ' ' : '') + data.text;
+              row.querySelector('.status').textContent = 'listening...';
+              row.querySelector('.status').className = 'status';
+              const tag = data.model ? `[${{data.model}}] ` : '';
+              row.querySelector('.reply').textContent = tag + state.transcript;
+            }} else if (!data.ok) {{
+              row.querySelector('.reply').textContent = 'chunk error: ' + data.error;
+            }}
+            // empty/silent chunks just add nothing and the loop continues
+          }}
+        }}
+
+        async function toggleListen(rowKey, providerKey) {{
           const row = document.getElementById('row-' + rowKey);
           const btn = document.getElementById('rec-btn-' + rowKey);
+          const existing = listenState[rowKey];
 
-          if (activeRecordings[rowKey]) {{
-            // Already recording -- this click means Stop.
-            activeRecordings[rowKey].recorder.stop();
+          if (existing && existing.listening) {{
+            // Stop listening.
+            existing.listening = false;
+            existing.stream.getTracks().forEach((t) => t.stop());
+            delete listenState[rowKey];
+            btn.textContent = '🎤 Listen';
+            row.querySelector('.status').textContent = 'OK';
+            row.querySelector('.status').className = 'status ok';
             return;
           }}
 
@@ -255,49 +313,11 @@ def status_page():
             return;
           }}
 
-          const recorder = new MediaRecorder(stream);
-          const chunks = [];
-          recorder.ondataavailable = (e) => {{ if (e.data.size > 0) chunks.push(e.data); }};
-
-          recorder.onstop = async () => {{
-            stream.getTracks().forEach((t) => t.stop());
-            delete activeRecordings[rowKey];
-            btn.textContent = '🎤 Record';
-            btn.disabled = true;
-
-            row.querySelector('.status').textContent = 'testing...';
-            const blob = new Blob(chunks, {{ type: 'audio/webm' }});
-            const select = document.getElementById('model-' + rowKey);
-            let url = '/api/stt-test/' + providerKey;
-            if (select) {{
-              url += '?model=' + encodeURIComponent(select.value);
-            }}
-            const formData = new FormData();
-            formData.append('audio', blob, 'recording.webm');
-            try {{
-              const res = await fetch(url, {{ method: 'POST', body: formData }});
-              const data = await res.json();
-              renderResult(row, data);
-            }} catch (err) {{
-              row.querySelector('.status').textContent = 'FAILED';
-              row.querySelector('.status').className = 'status fail';
-              row.querySelector('.reply').textContent = 'Upload error: ' + err.message;
-            }} finally {{
-              btn.disabled = false;
-            }}
-          }};
-
-          activeRecordings[rowKey] = {{ recorder, stream }};
-          recorder.start();
+          listenState[rowKey] = {{ stream, listening: true, transcript: '' }};
           btn.textContent = '⏹ Stop';
-          row.querySelector('.status').textContent = 'recording... click Stop when done';
-
-          // Safety net so a forgotten recording doesn't run forever.
-          setTimeout(() => {{
-            if (activeRecordings[rowKey]) {{
-              activeRecordings[rowKey].recorder.stop();
-            }}
-          }}, 15000);
+          row.querySelector('.status').textContent = 'listening...';
+          row.querySelector('.reply').textContent = '(listening...)';
+          listenLoop(rowKey, providerKey);
         }}
       </script>
     </body>
