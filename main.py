@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse
 from providers import (
     PROVIDERS,
     STT_PROVIDERS,
+    STT_LANGUAGES,
     REALTIME_PROVIDERS,
     run_test,
     run_stt_test,
@@ -53,19 +54,28 @@ def api_test_provider(provider_key: str, model: str | None = None):
 async def api_test_stt_provider(
     provider_key: str,
     model: str | None = None,
+    language: str | None = None,
     audio: UploadFile | None = File(None),
 ):
     """
     Speech-to-text test: sends audio to the provider's transcription
     API and returns what came back. "audio" is a real recording from
-    the /status page's mic button (Record -> speak -> Stop); if none
+    the /status page's mic button (Listen -> speak -> Stop); if none
     is attached, it falls back to a pre-recorded phrase as a plain
     connectivity check. "model" works the same way as the text-LLM
-    test above.
+    test above. "language" (e.g. "en"/"hi") tells the provider what
+    language to expect instead of guessing per chunk -- guessing is
+    unreliable on short, memory-less ~2.5s chunks.
     """
     audio_bytes = await audio.read() if audio is not None else None
     filename = audio.filename if audio is not None else None
-    return run_stt_test(provider_key, model, audio_bytes=audio_bytes, filename=filename)
+    return run_stt_test(
+        provider_key,
+        model,
+        audio_bytes=audio_bytes,
+        filename=filename,
+        language=language,
+    )
 
 
 @app.post("/api/realtime-test/{provider_key}")
@@ -112,12 +122,21 @@ def status_page():
             for key, p in PROVIDERS.items()
         )
 
+    def language_options():
+        return "".join(
+            f'<option value="{code}"{" selected" if code == "en" else ""}>{info["label"]}</option>'
+            for code, info in STT_LANGUAGES.items()
+        )
+
     def stt_rows():
         return "".join(
             f"""
             <tr id="row-stt-{key}">
               <td>{p['label']}</td>
-              <td><select id="model-stt-{key}">{model_options(p['models'])}</select></td>
+              <td>
+                <select id="model-stt-{key}">{model_options(p['models'])}</select>
+                <select id="lang-stt-{key}" title="Language you'll speak">{language_options()}</select>
+              </td>
               <td class="status">not tested</td>
               <td class="ttft">—</td>
               <td class="total">—</td>
@@ -173,7 +192,7 @@ def status_page():
       </table>
 
       <h3>Speech-to-text (STT)</h3>
-      <p style="font-size:13px;color:#555">Click Listen and just talk -- your mic streams in short chunks that get transcribed live and appended below as you speak. Click Stop when done. (Neither provider's API is truly continuous-streaming from a plain HTTP call, so this is near-real-time in ~2.5s chunks, not word-by-word.)</p>
+      <p style="font-size:13px;color:#555">Pick the language you'll speak (auto-detect on 2.5s chunks is unreliable, especially Hindi/Urdu), click Listen and just talk -- your mic streams in short chunks that get transcribed live and appended below as you speak. Click Stop when done. (Neither provider's API is truly continuous-streaming from a plain HTTP call, so this is near-real-time in ~2.5s chunks, not word-by-word.)</p>
       <table>
         <tr>
           <th>Provider</th><th>Model</th><th>Status</th>
@@ -250,11 +269,13 @@ def status_page():
         }}
 
         async function transcribeChunk(rowKey, providerKey, blob) {{
-          const select = document.getElementById('model-' + rowKey);
+          const modelSelect = document.getElementById('model-' + rowKey);
+          const langSelect = document.getElementById('lang-' + rowKey);
           let url = '/api/stt-test/' + providerKey;
-          if (select) {{
-            url += '?model=' + encodeURIComponent(select.value);
-          }}
+          const params = [];
+          if (modelSelect) params.push('model=' + encodeURIComponent(modelSelect.value));
+          if (langSelect) params.push('language=' + encodeURIComponent(langSelect.value));
+          if (params.length) url += '?' + params.join('&');
           const formData = new FormData();
           formData.append('audio', blob, 'chunk.webm');
           const res = await fetch(url, {{ method: 'POST', body: formData }});
@@ -264,26 +285,41 @@ def status_page():
         async function listenLoop(rowKey, providerKey) {{
           const row = document.getElementById('row-' + rowKey);
           const state = listenState[rowKey];
+          let seq = 0;
+          const results = {{}};
+          let nextToShow = 0;
+          let modelTag = '';
+
+          function flush() {{
+            while (Object.prototype.hasOwnProperty.call(results, nextToShow)) {{
+              const data = results[nextToShow];
+              delete results[nextToShow];
+              nextToShow++;
+              if (data.ok && data.text) {{
+                if (data.model) modelTag = `[${{data.model}}] `;
+                state.transcript += (state.transcript ? ' ' : '') + data.text;
+              }} else if (!data.ok) {{
+                state.transcript += (state.transcript ? ' ' : '') + `[chunk error: ${{data.error}}]`;
+              }}
+              // empty/silent OK chunks just add nothing
+            }}
+            row.querySelector('.reply').textContent = modelTag + (state.transcript || '(listening...)');
+          }}
+
+          // Recording the NEXT chunk starts right away instead of
+          // waiting for the previous chunk's transcript to come back --
+          // otherwise a slow model makes it look like the mic stopped
+          // listening while it waits on the network.
           while (state && state.listening) {{
+            const mySeq = seq++;
             const blob = await recordOneChunk(state.stream);
             if (!state.listening) break;
-            let data;
-            try {{
-              data = await transcribeChunk(rowKey, providerKey, blob);
-            }} catch (err) {{
-              data = {{ ok: false, error: 'Upload error: ' + err.message }};
-            }}
-            if (!state.listening) break;
-            if (data.ok && data.text) {{
-              state.transcript += (state.transcript ? ' ' : '') + data.text;
-              row.querySelector('.status').textContent = 'listening...';
-              row.querySelector('.status').className = 'status';
-              const tag = data.model ? `[${{data.model}}] ` : '';
-              row.querySelector('.reply').textContent = tag + state.transcript;
-            }} else if (!data.ok) {{
-              row.querySelector('.reply').textContent = 'chunk error: ' + data.error;
-            }}
-            // empty/silent chunks just add nothing and the loop continues
+            transcribeChunk(rowKey, providerKey, blob)
+              .then((data) => {{ results[mySeq] = data; flush(); }})
+              .catch((err) => {{
+                results[mySeq] = {{ ok: false, error: 'Upload error: ' + err.message }};
+                flush();
+              }});
           }}
         }}
 

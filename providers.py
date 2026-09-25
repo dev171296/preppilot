@@ -111,7 +111,10 @@ PROVIDERS = {
         "api_key_env": "NVIDIA_API_KEY",
         "extra_body": {
             "chat_template_kwargs": {"enable_thinking": True},
-            "reasoning_budget": 256,
+            # Trimmed from 256 -> 64 (25 Sep 2026): 256 "thinking" tokens
+            # made this smoke test take 55+ seconds. This is just a
+            # connectivity/latency check, not a real reasoning task.
+            "reasoning_budget": 64,
         },
     },
     "groq": {
@@ -278,11 +281,29 @@ def _to_wav16k_bytes(audio_bytes: bytes) -> bytes:
     return result.stdout
 
 
+# STT language hint -> what each provider actually wants. Whisper
+# takes a plain ISO-639-1 code; Riva wants a BCP-47 locale. Auto-detect
+# (no hint) sounds appealing but is unreliable on short, independent
+# ~2.5s chunks with no memory of the previous chunk -- Whisper in
+# particular keeps re-guessing per chunk and flips between Hindi and
+# Urdu (near-identical spoken languages, different scripts) or
+# produces gibberish. Telling it the language up front fixes that.
+# NOTE: NVIDIA's hosted Parakeet model is (as far as we've verified)
+# English-only -- picking Hindi for it may just fail; that's a real
+# answer from NVIDIA, not something to hide.
+STT_LANGUAGES = {
+    "en": {"label": "English", "whisper": "en", "riva": "en-US"},
+    "hi": {"label": "Hindi", "whisper": "hi", "riva": "hi-IN"},
+}
+DEFAULT_STT_LANGUAGE = "en"
+
+
 def run_stt_test(
     provider_key: str,
     model: str | None = None,
     audio_bytes: bytes | None = None,
     filename: str | None = None,
+    language: str | None = None,
 ) -> dict:
     """
     "audio_bytes" is the actual recording from the /status page's mic
@@ -293,7 +314,10 @@ def run_stt_test(
     When testing a real mic recording, "expected" is left out of the
     result since we don't know in advance what was said -- you just
     eyeball whether the transcript looks right.
+    "language" is one of STT_LANGUAGES's keys (e.g. "en"/"hi"); it
+    defaults to English if missing or unrecognized.
     """
+    lang = STT_LANGUAGES.get(language, STT_LANGUAGES[DEFAULT_STT_LANGUAGE])
     provider = STT_PROVIDERS.get(provider_key)
     if provider is None:
         return {"ok": False, "error": f"Unknown STT provider '{provider_key}'"}
@@ -322,6 +346,7 @@ def run_stt_test(
             result = client.audio.transcriptions.create(
                 model=chosen_model,
                 file=(filename or "recording.webm", audio_bytes),
+                language=lang["whisper"],
             )
             text = result.text
 
@@ -340,7 +365,7 @@ def run_stt_test(
             )
             asr_service = riva.client.ASRService(auth)
             config = riva.client.RecognitionConfig(
-                language_code="en-US",
+                language_code=lang["riva"],
                 max_alternatives=1,
                 sample_rate_hertz=NVIDIA_ASR_SAMPLE_RATE_HZ,
             )
