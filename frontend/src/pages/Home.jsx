@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
 
@@ -7,7 +8,9 @@ import { useAuth } from '../lib/AuthContext.jsx'
  * visitor is in the login journey:
  *   1. Logged out            -> AuthForm (login / signup)
  *   2. Logged in, no         -> DisclaimerGate (must accept before
- *      disclaimer accepted      using the app)
+ *      disclaimer accepted      using the app; sends them to Profile
+ *      accepted for the         right after, as their first step)
+ *      first time
  *   3. Logged in, accepted   -> a simple welcome/dashboard stub
  */
 function Home() {
@@ -134,9 +137,15 @@ function AuthForm() {
  * the disclaimer. Writing `disclaimer_accepted_at` is allowed by our
  * Supabase RLS policy ("update only where auth.uid() = id") because
  * they're updating their own row while logged in as themselves.
+ *
+ * Since this screen only ever appears the very first time someone
+ * gets past signup, accepting it doubles as "first-time onboarding
+ * complete" — so right after, we send them to Profile as their next
+ * natural step, instead of a generic welcome screen with nothing to do.
  */
 function DisclaimerGate() {
   const { session, refreshProfile, signOut } = useAuth()
+  const navigate = useNavigate()
   const [checked, setChecked] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
@@ -150,6 +159,7 @@ function DisclaimerGate() {
         .upsert({ id: session.user.id, disclaimer_accepted_at: new Date().toISOString() })
       if (upsertError) throw upsertError
       await refreshProfile()
+      navigate('/profile')
     } catch (err) {
       setError(err.message)
     } finally {
