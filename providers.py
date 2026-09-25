@@ -60,10 +60,12 @@ import asyncio
 import os
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 
 import websockets
 from openai import OpenAI
 from google import genai
+from google.genai import types as genai_types
 
 # ---------------------------------------------------------------------------
 # Text LLM providers
@@ -416,22 +418,58 @@ def run_stt_test(
 # provider slot, and says plainly why it can't be "tested" like the
 # others. Real testing happens in the browser once the Phase 4 voice
 # mock screen exists.
+# gemini-3.8-live is the current default Live API model (checked
+# against ai.google.dev/gemini-api/docs/models 25 Sep 2026) -- verify
+# this again if it starts 404ing, same lesson as the text models.
+GEMINI_LIVE_MODEL = "gemini-3.8-live"
+
 REALTIME_PROVIDERS = {
     "gemini_live": {
         "label": "Gemini Live (realtime speech-to-speech)",
+        "kind": "gemini_live_token",
+        "model": GEMINI_LIVE_MODEL,
         "note": (
-            "Browser talks to Gemini Live directly (no audio through our "
-            "server) — nothing for the backend to test. Will be tested "
-            "live in the browser once the Phase 4 voice-mock screen exists."
+            "The browser connects DIRECTLY to Gemini Live using a "
+            "short-lived token minted here -- your voice never passes "
+            "through our server, matching the app's real design. Click "
+            "Live Voice Test, talk, and Gemini should talk back."
         ),
     },
 }
+
+
+def create_gemini_live_token(model: str) -> dict:
+    """
+    Mints a short-lived, single-use auth token server-side (using our
+    real GEMINI_API_KEY, which never leaves the server) so the browser
+    can open its OWN direct connection to Gemini Live without us ever
+    handing out the real API key to whoever loads /status. Per
+    Google's own docs (ai.google.dev/gemini-api/docs/live-api/
+    ephemeral-tokens): 1 minute to start a session with it, 30 minutes
+    of messages once a session starts, and it's good for exactly one
+    use.
+    """
+    try:
+        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        now = datetime.now(timezone.utc)
+        token = client.auth_tokens.create(
+            config=genai_types.CreateAuthTokenConfig(
+                uses=1,
+                expire_time=now + timedelta(minutes=30),
+                new_session_expire_time=now + timedelta(minutes=1),
+            )
+        )
+        return {"ok": True, "token": token.name, "model": model}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def run_realtime_test(provider_key: str) -> dict:
     provider = REALTIME_PROVIDERS.get(provider_key)
     if provider is None:
         return {"ok": False, "error": f"Unknown realtime provider '{provider_key}'"}
+    if provider.get("kind") == "gemini_live_token":
+        return create_gemini_live_token(provider["model"])
     return {"ok": False, "planned": True, "error": provider["note"]}
 
 

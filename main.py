@@ -115,8 +115,11 @@ async def ws_stt_stream(websocket: WebSocket, provider_key: str, language: str |
 def api_test_realtime_provider(provider_key: str):
     """
     Realtime (speech-to-speech) providers connect browser-to-provider
-    directly, so there's no backend call to make yet — this just
-    returns the "not backend-testable" note for that provider.
+    directly -- for Gemini Live, this mints a short-lived, single-use
+    token server-side (our real GEMINI_API_KEY never leaves the
+    server) and hands it to the browser, which then opens its own
+    direct connection to Google using that token. Any other provider
+    here still just returns a "not backend-testable" note.
     """
     return run_realtime_test(provider_key)
 
@@ -190,11 +193,11 @@ def status_page():
             <tr id="row-realtime-{key}">
               <td>{p['label']}</td>
               <td>realtime (speech-to-speech)</td>
-              <td class="status">n/a — browser only</td>
+              <td class="status">not tested</td>
               <td class="ttft">—</td>
               <td class="total">—</td>
               <td class="reply">—</td>
-              <td><button onclick="testProvider('/api/realtime-test/', 'realtime-{key}', '{key}')">Why?</button></td>
+              <td><button id="rec-btn-realtime-{key}" onclick="toggleGeminiLive('realtime-{key}', '{key}')">🎙️ Live Voice Test</button></td>
             </tr>
             """
             for key, p in REALTIME_PROVIDERS.items()
@@ -239,7 +242,7 @@ def status_page():
       </table>
 
       <h3>Realtime (speech-to-speech)</h3>
-      <p style="font-size:13px;color:#555">These connect the browser directly to the provider — nothing for our backend to test yet.</p>
+      <p style="font-size:13px;color:#555">These connect the browser directly to the provider -- our server only mints a short-lived token, it never sees your audio. Click Live Voice Test and talk; Gemini should talk back.</p>
       <table>
         <tr>
           <th>Provider</th><th>Kind</th><th>Status</th>
@@ -527,6 +530,181 @@ def status_page():
               row.querySelector('.status').className = 'status ok';
             }}
           }};
+        }}
+        // ---- Gemini Live: real speech-to-speech, browser-to-Google direct ----
+        // Our server only mints a short-lived, single-use token
+        // (create_gemini_live_token in providers.py) -- it never
+        // touches your audio. The browser then talks straight to
+        // Google using Google's own JS SDK, loaded from esm.sh.
+        const geminiLiveState = {{}};
+
+        function pcm16ToBase64(int16Array) {{
+          const bytes = new Uint8Array(int16Array.buffer);
+          let binary = '';
+          for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+          return btoa(binary);
+        }}
+
+        function base64ToInt16Array(b64) {{
+          const binary = atob(b64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          return new Int16Array(bytes.buffer);
+        }}
+
+        async function toggleGeminiLive(rowKey, providerKey) {{
+          const row = document.getElementById('row-' + rowKey);
+          const btn = document.getElementById('rec-btn-' + rowKey);
+          const existing = geminiLiveState[rowKey];
+
+          if (existing) {{
+            try {{ existing.session && existing.session.close(); }} catch (e) {{}}
+            try {{ existing.processor && existing.processor.disconnect(); }} catch (e) {{}}
+            try {{ existing.source && existing.source.disconnect(); }} catch (e) {{}}
+            try {{ existing.micCtx && existing.micCtx.close(); }} catch (e) {{}}
+            try {{ existing.playCtx && existing.playCtx.close(); }} catch (e) {{}}
+            try {{ existing.stream.getTracks().forEach((t) => t.stop()); }} catch (e) {{}}
+            delete geminiLiveState[rowKey];
+            btn.textContent = '🎙️ Live Voice Test';
+            row.querySelector('.status').textContent = 'OK';
+            row.querySelector('.status').className = 'status ok';
+            return;
+          }}
+
+          row.querySelector('.status').textContent = 'getting token...';
+          let tokenData;
+          try {{
+            const res = await fetch('/api/realtime-test/' + providerKey, {{ method: 'POST' }});
+            tokenData = await res.json();
+          }} catch (err) {{
+            row.querySelector('.status').textContent = 'FAILED';
+            row.querySelector('.status').className = 'status fail';
+            row.querySelector('.reply').textContent = 'Token request error: ' + err.message;
+            return;
+          }}
+          if (!tokenData.ok) {{
+            row.querySelector('.status').textContent = 'FAILED';
+            row.querySelector('.status').className = 'status fail';
+            row.querySelector('.reply').textContent = tokenData.error;
+            return;
+          }}
+
+          let stream;
+          try {{
+            stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+          }} catch (err) {{
+            row.querySelector('.status').textContent = 'FAILED';
+            row.querySelector('.status').className = 'status fail';
+            row.querySelector('.reply').textContent = 'Mic error: ' + err.message;
+            return;
+          }}
+
+          row.querySelector('.status').textContent = 'connecting...';
+          const state = {{ stream, youText: '', geminiText: '', playHead: 0 }};
+          geminiLiveState[rowKey] = state;
+
+          function render() {{
+            const parts = [];
+            if (state.youText) parts.push('You: ' + state.youText);
+            if (state.geminiText) parts.push('Gemini: ' + state.geminiText);
+            row.querySelector('.reply').textContent = parts.length ? parts.join(' | ') : '(listening...)';
+          }}
+
+          // 24kHz mono PCM16 is what Live API audio output always
+          // uses, regardless of the 16kHz we send it -- per
+          // ai.google.dev/gemini-api/docs/live-api/capabilities.
+          const playCtx = new (window.AudioContext || window.webkitAudioContext)({{ sampleRate: 24000 }});
+          state.playCtx = playCtx;
+
+          function playAudioChunk(int16Array) {{
+            const float32 = new Float32Array(int16Array.length);
+            for (let i = 0; i < int16Array.length; i++) float32[i] = int16Array[i] / 0x8000;
+            const buffer = playCtx.createBuffer(1, float32.length, 24000);
+            buffer.copyToChannel(float32, 0);
+            const src = playCtx.createBufferSource();
+            src.buffer = buffer;
+            src.connect(playCtx.destination);
+            const startAt = Math.max(playCtx.currentTime, state.playHead);
+            src.start(startAt);
+            state.playHead = startAt + buffer.duration;
+          }}
+
+          try {{
+            const {{ GoogleGenAI, Modality }} = await import('https://esm.sh/@google/genai');
+            const ai = new GoogleGenAI({{ apiKey: tokenData.token }});
+            const session = await ai.live.connect({{
+              model: tokenData.model,
+              config: {{
+                responseModalities: [Modality.AUDIO],
+                inputAudioTranscription: {{}},
+                outputAudioTranscription: {{}},
+              }},
+              callbacks: {{
+                onopen: () => {{
+                  btn.textContent = '⏹ Stop';
+                  row.querySelector('.status').textContent = 'live -- talk now';
+                  row.querySelector('.status').className = 'status';
+                  render();
+                }},
+                onmessage: (message) => {{
+                  const content = message.serverContent;
+                  if (!content) return;
+                  if (content.inputTranscription && content.inputTranscription.text) {{
+                    state.youText += content.inputTranscription.text;
+                    render();
+                  }}
+                  if (content.outputTranscription && content.outputTranscription.text) {{
+                    state.geminiText += content.outputTranscription.text;
+                    render();
+                  }}
+                  if (content.modelTurn && content.modelTurn.parts) {{
+                    for (const part of content.modelTurn.parts) {{
+                      if (part.inlineData && part.inlineData.data) {{
+                        playAudioChunk(base64ToInt16Array(part.inlineData.data));
+                      }}
+                    }}
+                  }}
+                }},
+                onerror: (err) => {{
+                  row.querySelector('.status').textContent = 'FAILED';
+                  row.querySelector('.status').className = 'status fail';
+                  row.querySelector('.reply').textContent = 'Live API error: ' + (err && err.message ? err.message : err);
+                }},
+                onclose: () => {{
+                  if (geminiLiveState[rowKey] === state) {{
+                    delete geminiLiveState[rowKey];
+                    btn.textContent = '🎙️ Live Voice Test';
+                    row.querySelector('.status').textContent = 'OK';
+                    row.querySelector('.status').className = 'status ok';
+                  }}
+                }},
+              }},
+            }});
+            state.session = session;
+
+            const micCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const source = micCtx.createMediaStreamSource(stream);
+            const processor = micCtx.createScriptProcessor(4096, 1, 1);
+            state.micCtx = micCtx;
+            state.source = source;
+            state.processor = processor;
+
+            processor.onaudioprocess = (e) => {{
+              const input = e.inputBuffer.getChannelData(0);
+              const pcm16 = downsampleTo16kPCM16(input, micCtx.sampleRate);
+              session.sendRealtimeInput({{
+                audio: {{ data: pcm16ToBase64(pcm16), mimeType: 'audio/pcm;rate=16000' }},
+              }});
+            }};
+            source.connect(processor);
+            processor.connect(micCtx.destination);
+          }} catch (err) {{
+            row.querySelector('.status').textContent = 'FAILED';
+            row.querySelector('.status').className = 'status fail';
+            row.querySelector('.reply').textContent = 'Connect error: ' + err.message;
+            try {{ stream.getTracks().forEach((t) => t.stop()); }} catch (e) {{}}
+            delete geminiLiveState[rowKey];
+          }}
         }}
       </script>
     </body>
