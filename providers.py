@@ -41,13 +41,23 @@ current docs/catalogue page first — don't copy an ID from an old
 write-up or a deprecated models list. Two models already flagged as
 NOT safe to add here because they moved to enterprise-only pricing on
 Groq (08/16/2026): "llama-3.1-8b-instant" and "llama-3.3-70b-versatile".
+
+IMPORTANT — STT test audio is now a STATIC file, not synthesized live
+(lesson, 25 Sep 2026): the STT test used to call the real edge-tts
+online service at request time to generate the test sentence. On
+Render, Microsoft's speech endpoint rejected that connection outright
+(403 on the websocket handshake) — cloud/datacenter IPs get blocked
+there. So the test phrase now ships as a pre-recorded file,
+assets/stt_test_phrase.wav (16kHz mono, generated offline once with
+espeak-ng — a real voice engine isn't needed for a smoke test, just a
+consistent known phrase). This has nothing to do with edge-tts as our
+planned production TTS engine for real users' devices/browsers, which
+is a separate, still-valid plan — this only affects this one backend
+smoke test.
 """
 
 import os
 import time
-import asyncio
-import subprocess
-import tempfile
 
 from openai import OpenAI
 from google import genai
@@ -120,6 +130,11 @@ PROVIDERS = {
 
 TEST_PROMPT = "In one short sentence, say hello as if you are PrepPilot."
 
+# Requests to providers over a flaky/blocked network should fail fast
+# with a clear error, not hang the /status page's "testing..." state
+# forever.
+REQUEST_TIMEOUT_S = 20
+
 
 def run_test(provider_key: str, model: str | None = None) -> dict:
     """
@@ -159,6 +174,7 @@ def run_test(provider_key: str, model: str | None = None) -> dict:
             client = OpenAI(
                 api_key=os.environ[provider["api_key_env"]],
                 base_url=provider["base_url"],
+                timeout=REQUEST_TIMEOUT_S,
             )
             # "reasoning_effort" and similar knobs aren't part of the
             # standard OpenAI client signature, so anything extra a
@@ -203,10 +219,9 @@ def run_test(provider_key: str, model: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 # Speech-to-text (STT) providers
 # ---------------------------------------------------------------------------
-# The test here is a closed loop: we synthesize a short known sentence
-# with edge-tts (free, no key — the same engine the plan uses for
-# default TTS), then send that audio to each STT provider and check
-# whether the transcript comes back close to the original sentence.
+# The test here is a closed loop: send a known, pre-recorded sentence
+# (see the STATIC test audio note up top) to each STT provider and
+# check whether the transcript comes back close to the original.
 STT_PROVIDERS = {
     "groq_whisper": {
         "label": "Groq (Whisper)",
@@ -225,7 +240,13 @@ STT_PROVIDERS = {
 }
 
 STT_TEST_PHRASE = "PrepPilot is testing speech recognition."
-STT_VOICE = "en-US-AriaNeural"
+
+# Pre-recorded once, offline, with espeak-ng — 16kHz mono WAV, which is
+# also exactly the format NVIDIA's Riva ASR expects, so no on-the-fly
+# conversion step is needed any more either.
+STT_TEST_AUDIO_PATH = os.path.join(
+    os.path.dirname(__file__), "assets", "stt_test_phrase.wav"
+)
 
 # NVIDIA's ASR models are served over gRPC (via the nvidia-riva-client
 # package), not the simple REST/OpenAI-style call the LLM providers
@@ -237,32 +258,6 @@ STT_VOICE = "en-US-AriaNeural"
 NVIDIA_ASR_FUNCTION_ID = "d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965"
 
 
-def _get_test_audio_mp3() -> str:
-    """Synthesizes (and caches) the STT test phrase as an mp3 file."""
-    path = os.path.join(tempfile.gettempdir(), "preppilot_stt_test.mp3")
-    if not os.path.exists(path):
-        import edge_tts
-
-        async def _synthesize():
-            communicate = edge_tts.Communicate(STT_TEST_PHRASE, STT_VOICE)
-            await communicate.save(path)
-
-        asyncio.run(_synthesize())
-    return path
-
-
-def _mp3_to_wav16k(mp3_path: str) -> str:
-    """Converts mp3 -> 16kHz mono WAV, the format Riva ASR expects."""
-    wav_path = mp3_path.replace(".mp3", "_16k.wav")
-    if not os.path.exists(wav_path):
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", mp3_path, "-ar", "16000", "-ac", "1", wav_path],
-            check=True,
-            capture_output=True,
-        )
-    return wav_path
-
-
 def run_stt_test(provider_key: str, model: str | None = None) -> dict:
     provider = STT_PROVIDERS.get(provider_key)
     if provider is None:
@@ -271,14 +266,19 @@ def run_stt_test(provider_key: str, model: str | None = None) -> dict:
     chosen_model = model if model in provider["models"] else provider["models"][0]
     started = time.monotonic()
     try:
-        mp3_path = _get_test_audio_mp3()
+        if not os.path.exists(STT_TEST_AUDIO_PATH):
+            return {
+                "ok": False,
+                "error": f"Missing test audio file at {STT_TEST_AUDIO_PATH}",
+            }
 
         if provider["kind"] == "groq_stt":
             client = OpenAI(
                 api_key=os.environ["GROQ_API_KEY"],
                 base_url="https://api.groq.com/openai/v1",
+                timeout=REQUEST_TIMEOUT_S,
             )
-            with open(mp3_path, "rb") as f:
+            with open(STT_TEST_AUDIO_PATH, "rb") as f:
                 result = client.audio.transcriptions.create(
                     model=chosen_model, file=f
                 )
@@ -287,8 +287,7 @@ def run_stt_test(provider_key: str, model: str | None = None) -> dict:
         elif provider["kind"] == "nvidia_stt":
             import riva.client  # nvidia-riva-client package
 
-            wav_path = _mp3_to_wav16k(mp3_path)
-            with open(wav_path, "rb") as f:
+            with open(STT_TEST_AUDIO_PATH, "rb") as f:
                 audio_bytes = f.read()
 
             auth = riva.client.Auth(
