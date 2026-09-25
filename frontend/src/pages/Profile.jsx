@@ -2,7 +2,16 @@ import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
 
-const MAX_RESUME_BYTES = 5 * 1024 * 1024 // 5 MB — keep uploads small and fast
+const MAX_RESUME_BYTES = 5 * 1024 * 1024 // 5 MB — matches the Supabase Storage bucket's own limit
+
+// Maps each accepted file type to the extension we save it under. Kept
+// as an explicit map (rather than trusting the filename) so we always
+// know what kind of file is stored just from its path.
+const ALLOWED_RESUME_TYPES = {
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+}
 
 /**
  * The Profile screen. Everything here is optional — headline, summary,
@@ -93,12 +102,12 @@ function Profile() {
     if (!file) return
 
     setResumeError(null)
-    if (file.type !== 'application/pdf') {
-      setResumeError('Please choose a PDF file.')
+    if (!ALLOWED_RESUME_TYPES[file.type]) {
+      setResumeError('Please choose a PDF or Word document (.pdf, .doc, .docx).')
       return
     }
     if (file.size > MAX_RESUME_BYTES) {
-      setResumeError('That file is larger than 5 MB — please choose a smaller PDF.')
+      setResumeError('That file is larger than 5 MB — please choose a smaller file.')
       return
     }
     setResumeFile(file)
@@ -109,13 +118,22 @@ function Profile() {
     setResumeBusy(true)
     setResumeError(null)
     try {
-      // Stored at "<user id>/resume.pdf" — the storage policies only
+      const ext = ALLOWED_RESUME_TYPES[resumeFile.type]
+      // Stored at "<user id>/resume.<ext>" — the storage policies only
       // let each person read/write inside a folder named after their
       // own id, so this path is what makes that enforceable.
-      const path = `${session.user.id}/resume.pdf`
+      const path = `${session.user.id}/resume.${ext}`
+
+      // If they previously uploaded a different file type (e.g. had a
+      // .pdf, now uploading a .docx), the old file would otherwise be
+      // left behind under its own path — clean it up first.
+      if (profile?.resume_path && profile.resume_path !== path) {
+        await supabase.storage.from('resumes').remove([profile.resume_path])
+      }
+
       const { error: uploadError } = await supabase.storage
         .from('resumes')
-        .upload(path, resumeFile, { upsert: true, contentType: 'application/pdf' })
+        .upload(path, resumeFile, { upsert: true, contentType: resumeFile.type })
       if (uploadError) throw uploadError
 
       const { error: profileError } = await supabase
@@ -201,7 +219,7 @@ function Profile() {
       <h2>Resume</h2>
       {profile?.resume_path ? (
         <p>
-          A resume is on file.{' '}
+          A resume is on file ({profile.resume_path.split('.').pop().toUpperCase()}).{' '}
           {resumeUrl && (
             <a href={resumeUrl} target="_blank" rel="noreferrer">
               View it
@@ -213,9 +231,13 @@ function Profile() {
           </button>
         </p>
       ) : (
-        <p>No resume uploaded yet (PDF, up to 5 MB).</p>
+        <p>No resume uploaded yet (PDF or Word, up to 5 MB).</p>
       )}
-      <input type="file" accept="application/pdf" onChange={handleResumeChange} />
+      <input
+        type="file"
+        accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        onChange={handleResumeChange}
+      />
       {resumeFile && (
         <p>
           <button type="button" onClick={handleResumeUpload} disabled={resumeBusy}>
