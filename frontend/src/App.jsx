@@ -1,6 +1,7 @@
 import { NavLink, Route, Routes } from 'react-router-dom'
 import Home from './pages/Home.jsx'
 import Profile from './pages/Profile.jsx'
+import Tracks from './pages/Tracks.jsx'
 import Settings from './pages/Settings.jsx'
 import MockInterview from './pages/MockInterview.jsx'
 import { useAuth } from './lib/AuthContext.jsx'
@@ -14,11 +15,11 @@ const ADMIN_EMAILS = ['fromdevanshu@gmail.com']
 
 /**
  * The app's overall shell: a top bar with the screens we have so far,
- * and whichever screen is currently selected shown underneath. Real
- * interview logic isn't built yet — this is just the skeleton it will
- * live in. Login/signup and the one-time disclaimer live inside the
- * Home screen (Task #10); Profile is Phase 2; Settings (key vault) is
- * Phase 1, admin-only.
+ * and whichever screen is currently selected shown underneath.
+ * Login/signup and the one-time disclaimer live inside Home (Task
+ * #10); Profile is your general bio (Phase 2); Tracks holds each
+ * company/role you're preparing for with its own resume; Settings
+ * (key vault) is Phase 1, admin-only.
  */
 function App() {
   const { session, signOut } = useAuth()
@@ -33,6 +34,7 @@ function App() {
             Home
           </NavLink>
           {session && <NavLink to="/profile">Profile</NavLink>}
+          {session && <NavLink to="/tracks">Tracks</NavLink>}
           {isAdmin && <NavLink to="/settings">Settings</NavLink>}
           <NavLink to="/mock-interview">Mock Interview</NavLink>
           {session && (
@@ -47,6 +49,7 @@ function App() {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/profile" element={<Profile />} />
+          <Route path="/tracks" element={<Tracks />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/mock-interview" element={<MockInterview />} />
         </Routes>

@@ -153,3 +153,17 @@ button:disabled {
   border-radius: 4px;
   font-size: 0.85rem;
 }
+
+.track-card {
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.track-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
