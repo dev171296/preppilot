@@ -33,7 +33,7 @@ PROVIDERS = {
     },
     "groq": {
         "label": "Groq",
-        "model": "llama-3.1-8b-instant",
+        "model": "openai/gpt-oss-20b",
         "kind": "openai_compatible",
         "base_url": "https://api.groq.com/openai/v1",
         "api_key_env": "GROQ_API_KEY",
