@@ -43,10 +43,10 @@ function base64ToInt16Array(b64) {
  * Builds the instructions Gemini gets before the conversation starts.
  * This is the whole trick behind "Gemini improvises the questions
  * live" -- there's no fixed question list anywhere; instead Gemini is
- * told who the candidate is and what role/company they're aiming for,
- * and asked to run a real interview itself.
+ * told who the candidate is, what role/company/job description they're
+ * aiming for, and asked to run a real interview itself.
  */
-function buildSystemInstruction({ headline, summary, companyName, roleTitle, resumeText }) {
+function buildSystemInstruction({ headline, summary, companyName, roleTitle, resumeText, jdText }) {
   const lines = [
     "You are conducting a realistic mock job interview. Speak naturally, ask one " +
       "question at a time, and wait for the candidate's full spoken answer before " +
@@ -63,6 +63,7 @@ function buildSystemInstruction({ headline, summary, companyName, roleTitle, res
   }
   if (headline) lines.push(`Candidate headline: ${headline}`)
   if (summary) lines.push(`Candidate summary: ${summary}`)
+  if (jdText) lines.push(`Job description for this role:\n${jdText}`)
   if (resumeText) lines.push(`Candidate resume:\n${resumeText}`)
   lines.push('Start by briefly greeting the candidate, then ask your first question.')
   return lines.join('\n\n')
@@ -71,7 +72,7 @@ function buildSystemInstruction({ headline, summary, companyName, roleTitle, res
 /**
  * The real Mock Interview screen: pick which Track you're practicing
  * for, start a live voice conversation with Gemini (primed with that
- * Track's company/role/resume plus your general profile), talk, and
+ * Track's company/role/JD/resume plus your general profile), talk, and
  * end it whenever you're done. No scoring/rating yet -- that's the
  * next step, once this core live-conversation part is confirmed
  * working end to end.
@@ -83,19 +84,26 @@ function MockInterview() {
   const [selectedTrackId, setSelectedTrackId] = useState('')
   const [status, setStatus] = useState('idle') // idle | preparing | live
   const [error, setError] = useState(null)
-  const [youText, setYouText] = useState('')
-  const [geminiText, setGeminiText] = useState('')
+  // A chronological list of {speaker: 'you' | 'gemini', text} turns --
+  // NOT two giant lifetime blobs like the first version had. That
+  // earlier version showed "everything you ever said" as one paragraph
+  // and "everything Gemini ever said" as a separate paragraph below it,
+  // with no sense of order -- which read like a jumbled, merged mess
+  // instead of a back-and-forth conversation. This keeps entries in
+  // the order they actually happened, appending to the last entry only
+  // while the same speaker keeps talking.
+  const [turns, setTurns] = useState([])
 
   // All the mutable audio/session plumbing lives in a ref, not state --
   // it's updated from audio callbacks many times a second and doesn't
-  // need to trigger re-renders itself (only youText/geminiText/status do).
+  // need to trigger re-renders itself (only turns/status do).
   const liveRef = useRef(null)
 
   useEffect(() => {
     if (!session) return
     supabase
       .from('tracks')
-      .select('id, company_name, role_title, resume_path')
+      .select('id, company_name, role_title, resume_path, jd_text, jd_path')
       .order('created_at', { ascending: false })
       .then(({ data, error: fetchError }) => {
         if (!fetchError) setTracks(data || [])
@@ -116,29 +124,48 @@ function MockInterview() {
 
   const selectedTrack = tracks.find((t) => t.id === selectedTrackId)
 
-  async function extractResumeText(track) {
-    if (!track?.resume_path) return ''
-    const { data, error: urlError } = await supabase.storage.from('resumes').createSignedUrl(track.resume_path, 300)
-    if (urlError) throw new Error('Could not read resume: ' + urlError.message)
+  // Reused for both a Track's resume file and its JD file -- the
+  // backend endpoint just extracts text from a PDF/Word file at a URL,
+  // it doesn't care which kind of document it is.
+  async function extractFileText(path) {
+    if (!path) return ''
+    const { data, error: urlError } = await supabase.storage.from('resumes').createSignedUrl(path, 300)
+    if (urlError) throw new Error('Could not read file: ' + urlError.message)
     const res = await fetch(`${API_BASE}/api/extract-resume-text`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: data.signedUrl, filename: track.resume_path }),
+      body: JSON.stringify({ url: data.signedUrl, filename: path }),
     })
     const json = await res.json()
-    if (!json.ok) throw new Error(json.error || 'Could not read resume text')
+    if (!json.ok) throw new Error(json.error || 'Could not read file text')
     return json.text
+  }
+
+  function appendTurn(speaker, text) {
+    setTurns((prev) => {
+      if (prev.length > 0 && prev[prev.length - 1].speaker === speaker) {
+        const copy = prev.slice()
+        copy[copy.length - 1] = { speaker, text: copy[copy.length - 1].text + text }
+        return copy
+      }
+      return [...prev, { speaker, text }]
+    })
   }
 
   async function startInterview() {
     setError(null)
-    setYouText('')
-    setGeminiText('')
+    setTurns([])
     setStatus('preparing')
 
     let resumeText = ''
+    let jdText = selectedTrack?.jd_text || ''
     try {
-      resumeText = await extractResumeText(selectedTrack)
+      resumeText = await extractFileText(selectedTrack?.resume_path)
+      // A pasted JD (jd_text) always wins over an uploaded JD file --
+      // if someone pasted text there's no need to also parse a file.
+      if (!jdText && selectedTrack?.jd_path) {
+        jdText = await extractFileText(selectedTrack.jd_path)
+      }
     } catch (err) {
       setError(err.message)
       setStatus('idle')
@@ -162,7 +189,16 @@ function MockInterview() {
 
     let stream
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      // echoCancellation/noiseSuppression/autoGainControl: with only
+      // one mic, without headphones, the mic can pick up Gemini's own
+      // voice coming out of the speakers and send it back as "your"
+      // audio -- which is what made the "You" transcript look like it
+      // was merging with the interviewer's. This asks the browser to
+      // cancel that echo out at the source. Headphones avoid the
+      // problem entirely and are still the most reliable fix.
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      })
     } catch (err) {
       setError('Mic error: ' + err.message)
       setStatus('idle')
@@ -219,6 +255,7 @@ function MockInterview() {
         companyName: selectedTrack?.company_name,
         roleTitle: selectedTrack?.role_title,
         resumeText,
+        jdText,
       })
 
       const liveSession = await ai.live.connect({
@@ -238,10 +275,10 @@ function MockInterview() {
               stopQueuedAudioForInterruption()
             }
             if (content.inputTranscription?.text) {
-              setYouText((t) => t + content.inputTranscription.text)
+              appendTurn('you', content.inputTranscription.text)
             }
             if (content.outputTranscription?.text) {
-              setGeminiText((t) => t + content.outputTranscription.text)
+              appendTurn('gemini', content.outputTranscription.text)
             }
             if (content.modelTurn?.parts) {
               for (const part of content.modelTurn.parts) {
@@ -352,6 +389,10 @@ function MockInterview() {
               ))}
             </select>
           </label>
+          <p style={{ color: '#94a3b8', fontSize: '0.9rem' }}>
+            Tip: use headphones if you can — it keeps the interviewer's voice out of your mic, which
+            makes your transcript much cleaner.
+          </p>
           <p>
             <button type="button" onClick={startInterview} disabled={!selectedTrackId}>
               Start Interview
@@ -360,7 +401,7 @@ function MockInterview() {
         </>
       )}
 
-      {status === 'preparing' && <p>Getting ready… (reading resume, connecting to Gemini)</p>}
+      {status === 'preparing' && <p>Getting ready… (reading resume/JD, connecting to Gemini)</p>}
 
       {status === 'live' && (
         <p>
@@ -373,18 +414,13 @@ function MockInterview() {
 
       {error && <p className="form-error">{error}</p>}
 
-      {(youText || geminiText) && (
+      {turns.length > 0 && (
         <div className="transcript">
-          {youText && (
-            <p>
-              <strong>You:</strong> {youText}
+          {turns.map((turn, i) => (
+            <p key={i}>
+              <strong>{turn.speaker === 'you' ? 'You' : 'Interviewer'}:</strong> {turn.text}
             </p>
-          )}
-          {geminiText && (
-            <p>
-              <strong>Interviewer:</strong> {geminiText}
-            </p>
-          )}
+          ))}
         </div>
       )}
     </section>

@@ -12,12 +12,12 @@ const ALLOWED_RESUME_TYPES = {
 
 /**
  * A "Track" is one specific thing you're preparing for — a company and
- * a role, with its own resume — kept separate from every other one.
- * Example: "Backend Engineer @ Google" and "Data Analyst @ Meta" are
- * two different Tracks, each with their own target info and resume,
- * instead of one shared set of "target role/company" fields on your
- * main profile. This is where a mock interview (once built) will pull
- * its company/role/resume context from.
+ * a role, with its own resume and job description — kept separate from
+ * every other one. Example: "Backend Engineer @ Google" and "Data
+ * Analyst @ Meta" are two different Tracks, each with their own target
+ * info, resume, and JD, instead of one shared set of fields on your
+ * main profile. This is where Mock Interview pulls its company/role/
+ * resume/JD context from.
  */
 function Tracks() {
   const { session, loading: authLoading } = useAuth()
@@ -36,7 +36,7 @@ function Tracks() {
     setListError(null)
     const { data, error } = await supabase
       .from('tracks')
-      .select('id, company_name, role_title, resume_path, created_at')
+      .select('id, company_name, role_title, resume_path, jd_text, jd_path, created_at')
       .order('created_at', { ascending: false })
     if (error) {
       setListError(error.message)
@@ -79,8 +79,9 @@ function Tracks() {
   }
 
   async function handleDelete(track) {
-    if (track.resume_path) {
-      await supabase.storage.from('resumes').remove([track.resume_path])
+    const toRemove = [track.resume_path, track.jd_path].filter(Boolean)
+    if (toRemove.length > 0) {
+      await supabase.storage.from('resumes').remove(toRemove)
     }
     await supabase.from('tracks').delete().eq('id', track.id)
     loadTracks()
@@ -91,7 +92,7 @@ function Tracks() {
   return (
     <section>
       <h1>Your Tracks</h1>
-      <p>Each Track is one company + role you're preparing for, with its own resume.</p>
+      <p>Each Track is one company + role you're preparing for, with its own resume and job description.</p>
 
       {listError && <p className="form-error">{listError}</p>}
 
@@ -137,14 +138,22 @@ function Tracks() {
 
 /**
  * One Track's card: its company/role (shown, not editable here to keep
- * this simple — delete and re-add to change), and its own resume
- * upload, separate from every other Track's resume.
+ * this simple — delete and re-add to change), its own resume upload,
+ * and its own job description — either pasted as text or uploaded as a
+ * file — separate from every other Track's. A pasted JD always takes
+ * priority over an uploaded JD file when Mock Interview builds its
+ * context (no need to parse a file if you already gave us the text).
  */
 function TrackCard({ track, userId, onChanged, onDelete }) {
   const [resumeUrl, setResumeUrl] = useState(null)
   const [resumeFile, setResumeFile] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+
+  const [jdDraft, setJdDraft] = useState(track.jd_text || '')
+  const [jdBusy, setJdBusy] = useState(false)
+  const [jdFile, setJdFile] = useState(null)
+  const [jdError, setJdError] = useState(null)
 
   useEffect(() => {
     if (!track.resume_path) {
@@ -229,6 +238,83 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
     }
   }
 
+  async function handleSaveJdText() {
+    setJdBusy(true)
+    setJdError(null)
+    try {
+      const { error: trackError } = await supabase
+        .from('tracks')
+        .update({ jd_text: jdDraft.trim() || null })
+        .eq('id', track.id)
+      if (trackError) throw trackError
+      onChanged()
+    } catch (err) {
+      setJdError(err.message)
+    } finally {
+      setJdBusy(false)
+    }
+  }
+
+  function handleJdFileChange(e) {
+    const file = e.target.files?.[0]
+    setJdFile(null)
+    setJdError(null)
+    if (!file) return
+    if (!ALLOWED_RESUME_TYPES[file.type]) {
+      setJdError('Please choose a PDF or Word document (.pdf, .doc, .docx).')
+      return
+    }
+    if (file.size > MAX_RESUME_BYTES) {
+      setJdError('That file is larger than 5 MB — please choose a smaller file.')
+      return
+    }
+    setJdFile(file)
+  }
+
+  async function handleUploadJd() {
+    if (!jdFile) return
+    setJdBusy(true)
+    setJdError(null)
+    try {
+      const ext = ALLOWED_RESUME_TYPES[jdFile.type]
+      // Same bucket as resumes, distinguished by a "-jd" suffix — one
+      // JD file per Track, same folder-per-user access rule applies.
+      const path = `${userId}/${track.id}-jd.${ext}`
+      if (track.jd_path && track.jd_path !== path) {
+        await supabase.storage.from('resumes').remove([track.jd_path])
+      }
+      const { error: uploadError } = await supabase.storage
+        .from('resumes')
+        .upload(path, jdFile, { upsert: true, contentType: jdFile.type })
+      if (uploadError) throw uploadError
+
+      const { error: trackError } = await supabase.from('tracks').update({ jd_path: path }).eq('id', track.id)
+      if (trackError) throw trackError
+
+      setJdFile(null)
+      onChanged()
+    } catch (err) {
+      setJdError(err.message)
+    } finally {
+      setJdBusy(false)
+    }
+  }
+
+  async function handleRemoveJdFile() {
+    setJdBusy(true)
+    setJdError(null)
+    try {
+      await supabase.storage.from('resumes').remove([track.jd_path])
+      const { error: trackError } = await supabase.from('tracks').update({ jd_path: null }).eq('id', track.id)
+      if (trackError) throw trackError
+      onChanged()
+    } catch (err) {
+      setJdError(err.message)
+    } finally {
+      setJdBusy(false)
+    }
+  }
+
   return (
     <div className="track-card">
       <div className="track-card-header">
@@ -273,6 +359,47 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
         </p>
       )}
       {error && <p className="form-error">{error}</p>}
+
+      <h3 style={{ marginTop: '1rem', marginBottom: '0.4rem', fontSize: '1rem' }}>Job description (optional)</h3>
+      <label className="auth-form" style={{ marginBottom: '0.4rem' }}>
+        Paste JD text
+        <textarea
+          rows={4}
+          placeholder="Paste the job description here…"
+          value={jdDraft}
+          onChange={(e) => setJdDraft(e.target.value)}
+        />
+      </label>
+      <p>
+        <button type="button" onClick={handleSaveJdText} disabled={jdBusy}>
+          {jdBusy ? 'Saving…' : 'Save JD text'}
+        </button>
+      </p>
+
+      {track.jd_path ? (
+        <p>
+          JD file: {track.jd_path.split('.').pop().toUpperCase()}
+          {' · '}
+          <button type="button" className="link-button" onClick={handleRemoveJdFile} disabled={jdBusy}>
+            Remove
+          </button>
+        </p>
+      ) : (
+        <p>No JD file uploaded for this Track yet (you can paste text above instead).</p>
+      )}
+      <input
+        type="file"
+        accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        onChange={handleJdFileChange}
+      />
+      {jdFile && (
+        <p>
+          <button type="button" onClick={handleUploadJd} disabled={jdBusy}>
+            {jdBusy ? 'Uploading…' : `Upload ${jdFile.name}`}
+          </button>
+        </p>
+      )}
+      {jdError && <p className="form-error">{jdError}</p>}
     </div>
   )
 }
