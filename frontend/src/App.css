@@ -167,3 +167,14 @@ button:disabled {
   justify-content: space-between;
   margin-bottom: 0.5rem;
 }
+
+.transcript {
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+
+.transcript p {
+  margin: 0.4rem 0;
+}
