@@ -6,8 +6,16 @@ waits for requests and sends back answers. Every "@app.get(...)" or
 "@app.post(...)" line below is one address the service understands.
 """
 
+import io
+
+import httpx
+from docx2txt import process as extract_docx_text
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from pypdf import PdfReader
+
 from providers import (
     PROVIDERS,
     STT_PROVIDERS,
@@ -20,6 +28,22 @@ from providers import (
 )
 
 app = FastAPI(title="PrepPilot API")
+
+# The frontend (Cloudflare Pages) and this backend (Render) are two
+# different origins/domains, so without this the browser would block
+# every request from preppilot-2tm.pages.dev to this API. /status
+# never needed this because it's served BY this same backend
+# (same-origin) -- this is only needed now that a separate frontend
+# calls in from outside.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://preppilot-2tm.pages.dev",
+        "http://localhost:5173",  # local Vite dev server, for testing
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
@@ -120,8 +144,66 @@ def api_test_realtime_provider(provider_key: str):
     server) and hands it to the browser, which then opens its own
     direct connection to Google using that token. Any other provider
     here still just returns a "not backend-testable" note.
+
+    The real Mock Interview screen reuses this SAME endpoint
+    (provider_key="gemini_live") to start its own sessions -- minting
+    a token is exactly the same operation either way, so there's no
+    separate "real" endpoint for it.
     """
     return run_realtime_test(provider_key)
+
+
+class ResumeExtractRequest(BaseModel):
+    url: str
+    filename: str = ""
+
+
+MAX_RESUME_TEXT_CHARS = 6000  # this is LLM context, not a full copy -- keep it bounded
+
+
+@app.post("/api/extract-resume-text")
+async def api_extract_resume_text(payload: ResumeExtractRequest):
+    """
+    Downloads a resume file from a Supabase Storage signed URL (the
+    frontend already has permission to read it -- we just fetch and
+    extract text, never touching Supabase's storage API ourselves) and
+    pulls out its plain text, so a Mock Interview session can use it as
+    context for Gemini.
+
+    PDF text comes from pypdf; .docx from docx2txt. Old binary .doc
+    files aren't supported here (that format needs heavier tooling than
+    is worth adding for a fairly rare case) -- we say so clearly rather
+    than silently failing or returning garbage.
+    """
+    ext = payload.filename.rsplit(".", 1)[-1].lower() if "." in payload.filename else ""
+    if ext not in ("pdf", "docx", "doc"):
+        return {"ok": False, "error": f"Unsupported file type: '{ext or 'unknown'}'"}
+    if ext == "doc":
+        return {
+            "ok": False,
+            "error": "Old .doc files aren't supported for text extraction yet -- please re-upload as PDF or .docx.",
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(payload.url)
+            resp.raise_for_status()
+        content = resp.content
+
+        if ext == "pdf":
+            reader = PdfReader(io.BytesIO(content))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        else:  # docx
+            text = extract_docx_text(io.BytesIO(content))
+
+        text = text.strip()
+        if not text:
+            return {"ok": False, "error": "Couldn't find any text in that file (it may be a scanned image)."}
+
+        truncated = len(text) > MAX_RESUME_TEXT_CHARS
+        return {"ok": True, "text": text[:MAX_RESUME_TEXT_CHARS], "truncated": truncated}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.get("/status", response_class=HTMLResponse)
