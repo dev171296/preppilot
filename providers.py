@@ -57,6 +57,7 @@ smoke test.
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import time
@@ -230,6 +231,119 @@ def run_test(provider_key: str, model: str | None = None) -> dict:
 # The test here is a closed loop: send a known, pre-recorded sentence
 # (see the STATIC test audio note up top) to each STT provider and
 # check whether the transcript comes back close to the original.
+# ---------------------------------------------------------------------------
+# Mock Interview answer scoring (Stage B)
+# ---------------------------------------------------------------------------
+# Deliberately uses GROQ, not Gemini -- Gemini is busy running the live
+# voice interview itself (Mock Interview Stage A), so scoring calls go
+# to a different provider rather than competing with it for the same
+# key's rate limit. Groq is also fast, which matters here since we
+# want quick pointers to show up soon after each answer, not minutes
+# later.
+SCORING_MODEL = "openai/gpt-oss-120b"
+
+
+def score_interview_answer(question: str, answer: str, context: dict) -> dict:
+    """
+    Rates ONE answer from a mock interview: a 1-10 score, a couple of
+    short "quick pointers" (shown live, right after the answer), and a
+    longer narrative critique (saved for the end-of-session report).
+    Returns a plain dict, safe to turn into JSON.
+    """
+    context_lines = []
+    role = context.get("role_title") or ""
+    company = context.get("company_name") or ""
+    if role or company:
+        context_lines.append(f"Role: {role}" + (f" at {company}" if company else ""))
+    if context.get("jd_text"):
+        context_lines.append(f"Job description: {context['jd_text'][:1500]}")
+    context_block = "\n".join(context_lines)
+
+    system_prompt = (
+        "You are an expert interview coach reviewing ONE answer from a mock "
+        "job interview. Be honest and specific, not just encouraging -- "
+        "point out real gaps as well as strengths. Respond with ONLY a JSON "
+        "object, no other text, in exactly this shape: "
+        '{"score": <integer 1-10>, "quick_pointers": [<1 to 3 short strings, '
+        'each under 12 words>], "detailed_feedback": "<2-4 sentence narrative '
+        'critique>"}'
+    )
+    user_prompt = (
+        (context_block + "\n\n" if context_block else "")
+        + f"Interview question: {question}\n\nCandidate's answer: {answer}"
+    )
+
+    try:
+        client = OpenAI(
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://api.groq.com/openai/v1",
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        resp = client.chat.completions.create(
+            model=SCORING_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        parsed = json.loads(resp.choices[0].message.content)
+        return {
+            "ok": True,
+            "score": parsed.get("score"),
+            "quick_pointers": parsed.get("quick_pointers", []),
+            "detailed_feedback": parsed.get("detailed_feedback", ""),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def score_interview_session_summary(answers: list) -> dict:
+    """
+    Once a mock interview ends, writes ONE short overall narrative --
+    strengths, weaknesses, and one concrete thing to improve next time
+    -- from that session's already-scored answers. This is the
+    "fuller end-of-session report" half of Stage B (the per-answer
+    scoring above is the "brief note after each answer" half).
+    """
+    lines = []
+    for i, a in enumerate(answers, start=1):
+        lines.append(
+            f"Q{i}: {a.get('question', '')}\n"
+            f"Score: {a.get('score', '?')}/10\n"
+            f"Feedback: {a.get('detailed_feedback', '')}"
+        )
+    joined = "\n\n".join(lines)
+
+    system_prompt = (
+        "You are an interview coach writing a short overall summary of a "
+        "candidate's full mock interview, based on the per-question scores "
+        "and feedback already given to them. Respond with ONLY a JSON "
+        "object, no other text, in exactly this shape: "
+        '{"overall_summary": "<3-5 sentence summary covering strengths, '
+        'weaknesses, and one concrete thing to improve next time>"}'
+    )
+
+    try:
+        client = OpenAI(
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://api.groq.com/openai/v1",
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        resp = client.chat.completions.create(
+            model=SCORING_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": joined},
+            ],
+            response_format={"type": "json_object"},
+        )
+        parsed = json.loads(resp.choices[0].message.content)
+        return {"ok": True, "overall_summary": parsed.get("overall_summary", "")}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 STT_PROVIDERS = {
     "groq_whisper": {
         "label": "Groq (Whisper)",

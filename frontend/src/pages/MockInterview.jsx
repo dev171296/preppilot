@@ -9,10 +9,6 @@ import { useAuth } from '../lib/AuthContext.jsx'
 const API_BASE = import.meta.env.VITE_API_BASE_URL
 
 // ---- Shared with /status's Gemini Live implementation (main.py) ----
-// Same math, same reasoning: the mic gives us Float32 samples at
-// whatever rate the browser feels like (44.1kHz, 48kHz, ...); Gemini
-// Live wants 16kHz 16-bit integers. This does a simple "skip samples"
-// resample rather than anything fancier -- good enough for speech.
 function downsampleTo16kPCM16(float32Samples, inputSampleRate) {
   const ratio = inputSampleRate / 16000
   const outLength = Math.floor(float32Samples.length / ratio)
@@ -39,13 +35,6 @@ function base64ToInt16Array(b64) {
   return new Int16Array(bytes.buffer)
 }
 
-/**
- * Builds the instructions Gemini gets before the conversation starts.
- * This is the whole trick behind "Gemini improvises the questions
- * live" -- there's no fixed question list anywhere; instead Gemini is
- * told who the candidate is, what role/company/job description they're
- * aiming for, and asked to run a real interview itself.
- */
 function buildSystemInstruction({ headline, summary, companyName, roleTitle, resumeText, jdText }) {
   const lines = [
     "You are conducting a realistic mock job interview. Speak naturally, ask one " +
@@ -70,34 +59,48 @@ function buildSystemInstruction({ headline, summary, companyName, roleTitle, res
 }
 
 /**
- * The real Mock Interview screen: pick which Track you're practicing
- * for, start a live voice conversation with Gemini (primed with that
- * Track's company/role/JD/resume plus your general profile), talk, and
- * end it whenever you're done. No scoring/rating yet -- that's the
- * next step, once this core live-conversation part is confirmed
- * working end to end.
+ * Mock Interview screen. Stage A (live voice conversation) plus Stage
+ * B (scoring): while you talk, each finished answer quietly gets a
+ * score + a couple of quick pointers from Groq (a different provider
+ * from Gemini, which is busy running the live voice side, so scoring
+ * never competes with it for rate limits) shown in a side panel. When
+ * you end the interview, everything gets rolled up into one
+ * end-of-session report with an overall score and summary.
  */
 function MockInterview() {
   const { session, profile } = useAuth()
 
   const [tracks, setTracks] = useState([])
   const [selectedTrackId, setSelectedTrackId] = useState('')
-  const [status, setStatus] = useState('idle') // idle | preparing | live
+  // idle | preparing | live | ending | ended
+  const [status, setStatus] = useState('idle')
   const [error, setError] = useState(null)
-  // A chronological list of {speaker: 'you' | 'gemini', text} turns --
-  // NOT two giant lifetime blobs like the first version had. That
-  // earlier version showed "everything you ever said" as one paragraph
-  // and "everything Gemini ever said" as a separate paragraph below it,
-  // with no sense of order -- which read like a jumbled, merged mess
-  // instead of a back-and-forth conversation. This keeps entries in
-  // the order they actually happened, appending to the last entry only
-  // while the same speaker keeps talking.
+  // Chronological {speaker: 'you' | 'gemini', text} turns -- appended
+  // to the last entry while the same speaker keeps talking, so this
+  // array always strictly alternates speakers. That alternation is
+  // also what makes answer-segmentation below possible: turn N-3 is
+  // the question, N-2 is the answer, once turn N-1 (a NEW gemini turn)
+  // shows the candidate has finished answering.
   const [turns, setTurns] = useState([])
+  const [answerScores, setAnswerScores] = useState([]) // {question, answer, score, quickPointers, detailedFeedback}
+  const [sessionReport, setSessionReport] = useState(null) // {overallScore, overallSummary}
 
-  // All the mutable audio/session plumbing lives in a ref, not state --
-  // it's updated from audio callbacks many times a second and doesn't
-  // need to trigger re-renders itself (only turns/status do).
   const liveRef = useRef(null)
+  const turnsRef = useRef([])
+  const answerScoresRef = useRef([])
+  const scoredThroughRef = useRef(-1) // index (in turns) of the last 'you' turn already scored
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    turnsRef.current = turns
+  }, [turns])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
     if (!session) return
@@ -111,22 +114,38 @@ function MockInterview() {
   }, [session])
 
   // Make sure the mic/session actually get torn down if the person
-  // navigates away mid-interview, not just when they click End.
+  // navigates away mid-interview, not just when they click End. This
+  // does NOT run the scoring/report flow -- that's only for a
+  // deliberate "End Interview" click.
   useEffect(() => {
     return () => stopInterview()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  const selectedTrack = tracks.find((t) => t.id === selectedTrackId)
+
+  // Whenever a fresh gemini turn appears right after a 'you' turn,
+  // that 'you' turn is a finished answer -- score it. Runs on every
+  // turns update but only fires once per answer (scoredThroughRef).
+  useEffect(() => {
+    const n = turns.length
+    if (n < 3) return
+    if (turns[n - 1].speaker !== 'gemini') return
+    const answerIdx = n - 2
+    if (turns[answerIdx].speaker !== 'you') return
+    if (answerIdx <= scoredThroughRef.current) return
+    scoredThroughRef.current = answerIdx
+    const question = turns[n - 3]?.text || ''
+    const answer = turns[answerIdx].text
+    scoreAnswer(question, answer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turns])
 
   if (!session) return <p>Log in to start a mock interview.</p>
   if (!API_BASE) {
     return <p className="form-error">Mock Interview isn't configured yet (missing API base URL).</p>
   }
 
-  const selectedTrack = tracks.find((t) => t.id === selectedTrackId)
-
-  // Reused for both a Track's resume file and its JD file -- the
-  // backend endpoint just extracts text from a PDF/Word file at a URL,
-  // it doesn't care which kind of document it is.
   async function extractFileText(path) {
     if (!path) return ''
     const { data, error: urlError } = await supabase.storage.from('resumes').createSignedUrl(path, 300)
@@ -152,17 +171,125 @@ function MockInterview() {
     })
   }
 
+  // Scoring is a nice-to-have layered on top of the actual interview
+  // -- if it fails (bad key, provider hiccup, rate limit) that should
+  // never interrupt or crash the live conversation, just silently skip
+  // that one answer's feedback.
+  async function scoreAnswer(question, answer) {
+    if (!answer || !answer.trim()) return
+    try {
+      const res = await fetch(`${API_BASE}/api/score-answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: question || '',
+          answer,
+          company_name: selectedTrack?.company_name || '',
+          role_title: selectedTrack?.role_title || '',
+          jd_text: selectedTrack?.jd_text || '',
+        }),
+      })
+      const json = await res.json()
+      if (!json.ok) return
+      const entry = {
+        question: question || '',
+        answer,
+        score: json.score,
+        quickPointers: json.quick_pointers || [],
+        detailedFeedback: json.detailed_feedback || '',
+      }
+      // Mutate the ref directly (not just via setState) so a later
+      // `await scoreAnswer(...)` in finalizeSession can rely on
+      // answerScoresRef.current already reflecting this answer the
+      // moment this function returns -- state updates alone would lag
+      // a render behind.
+      answerScoresRef.current = [...answerScoresRef.current, entry]
+      if (mountedRef.current) setAnswerScores(answerScoresRef.current)
+
+      const sid = liveRef.current?.sessionId
+      if (sid) {
+        const { error: insertError } = await supabase.from('interview_answers').insert({
+          session_id: sid,
+          question_text: entry.question,
+          answer_transcript: entry.answer,
+          score: entry.score,
+          quick_pointers: entry.quickPointers,
+          detailed_feedback: entry.detailedFeedback,
+        })
+        if (insertError) console.error('Failed to save answer score:', insertError.message)
+      }
+    } catch (err) {
+      console.error('Scoring error:', err.message)
+    }
+  }
+
+  // Runs the moment "End Interview" is clicked (audio is already torn
+  // down by then): scores any trailing answer that never got a
+  // follow-up question, asks for one overall narrative summary, saves
+  // the session row, and shows the report.
+  async function finalizeSession() {
+    const t = turnsRef.current
+    const lastIdx = t.length - 1
+    if (lastIdx >= 0 && t[lastIdx].speaker === 'you' && lastIdx > scoredThroughRef.current) {
+      scoredThroughRef.current = lastIdx
+      const question = t[lastIdx - 1]?.text || ''
+      await scoreAnswer(question, t[lastIdx].text)
+    }
+
+    const scores = answerScoresRef.current
+    const overallScore =
+      scores.length > 0
+        ? Math.round((scores.reduce((sum, a) => sum + (Number(a.score) || 0), 0) / scores.length) * 10) / 10
+        : null
+
+    let overallSummary = ''
+    if (scores.length > 0) {
+      try {
+        const res = await fetch(`${API_BASE}/api/score-session-summary`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            answers: scores.map((a) => ({
+              question: a.question,
+              score: a.score,
+              detailed_feedback: a.detailedFeedback,
+            })),
+          }),
+        })
+        const json = await res.json()
+        if (json.ok) overallSummary = json.overall_summary
+      } catch (err) {
+        console.error('Summary error:', err.message)
+      }
+    }
+
+    const sid = liveRef.current?.sessionId
+    if (sid) {
+      const { error: updateError } = await supabase
+        .from('interview_sessions')
+        .update({ ended_at: new Date().toISOString(), overall_score: overallScore, overall_summary: overallSummary })
+        .eq('id', sid)
+      if (updateError) console.error('Failed to save session report:', updateError.message)
+    }
+
+    if (!mountedRef.current) return
+    setSessionReport({ overallScore, overallSummary })
+    setStatus('ended')
+  }
+
   async function startInterview() {
     setError(null)
     setTurns([])
+    setAnswerScores([])
+    answerScoresRef.current = []
+    scoredThroughRef.current = -1
+    setSessionReport(null)
     setStatus('preparing')
 
     let resumeText = ''
     let jdText = selectedTrack?.jd_text || ''
     try {
       resumeText = await extractFileText(selectedTrack?.resume_path)
-      // A pasted JD (jd_text) always wins over an uploaded JD file --
-      // if someone pasted text there's no need to also parse a file.
       if (!jdText && selectedTrack?.jd_path) {
         jdText = await extractFileText(selectedTrack.jd_path)
       }
@@ -189,13 +316,6 @@ function MockInterview() {
 
     let stream
     try {
-      // echoCancellation/noiseSuppression/autoGainControl: with only
-      // one mic, without headphones, the mic can pick up Gemini's own
-      // voice coming out of the speakers and send it back as "your"
-      // audio -- which is what made the "You" transcript look like it
-      // was merging with the interviewer's. This asks the browser to
-      // cancel that echo out at the source. Headphones avoid the
-      // problem entirely and are still the most reliable fix.
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       })
@@ -205,11 +325,24 @@ function MockInterview() {
       return
     }
 
-    const state = { stream, playHead: 0, scheduledSources: [] }
+    const state = { stream, playHead: 0, scheduledSources: [], sessionId: null }
     liveRef.current = state
 
-    // 24kHz mono PCM16 is what Live API audio output always uses,
-    // regardless of the 16kHz we send it (per Google's own docs).
+    // Create the interview_sessions row now -- scoring/session
+    // tracking is a nice-to-have, so a failure here is logged but
+    // never blocks the actual interview from starting.
+    try {
+      const { data: sessionRow, error: sessionError } = await supabase
+        .from('interview_sessions')
+        .insert({ user_id: session.user.id, track_id: selectedTrackId })
+        .select('id')
+        .single()
+      if (sessionError) throw sessionError
+      state.sessionId = sessionRow.id
+    } catch (err) {
+      console.error('Could not create interview session row:', err.message)
+    }
+
     const playCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 })
     state.playCtx = playCtx
 
@@ -231,9 +364,6 @@ function MockInterview() {
       }
     }
 
-    // Per Google's docs: on an interruption, the CLIENT must stop
-    // playback and clear queued audio itself -- the server only tells
-    // us it happened, it doesn't silence our speakers for us.
     function stopQueuedAudioForInterruption() {
       for (const src of state.scheduledSources) {
         try {
@@ -327,6 +457,10 @@ function MockInterview() {
     }
   }
 
+  // Pure teardown -- audio/mic/websocket only, no scoring or status
+  // changes. Used both by the unmount cleanup effect and by a
+  // deliberate "End Interview" click (which separately drives the
+  // scoring/report flow via finalizeSession).
   function stopInterview() {
     const state = liveRef.current
     if (!state) return
@@ -361,14 +495,29 @@ function MockInterview() {
       /* ignore */
     }
     liveRef.current = null
+  }
+
+  async function handleEndInterview() {
+    stopInterview()
+    setStatus('ending')
+    await finalizeSession()
+  }
+
+  function handleStartAnother() {
     setStatus('idle')
+    setError(null)
+    setTurns([])
+    setAnswerScores([])
+    answerScoresRef.current = []
+    scoredThroughRef.current = -1
+    setSessionReport(null)
   }
 
   return (
     <section>
       <h1>Mock Interview</h1>
 
-      {tracks.length === 0 && (
+      {tracks.length === 0 && status === 'idle' && (
         <p>
           Add a Track first (company + role) on the <a href="/tracks">Tracks</a> page to start a mock
           interview.
@@ -406,21 +555,81 @@ function MockInterview() {
       {status === 'live' && (
         <p>
           🎙️ Live — talk now.{' '}
-          <button type="button" onClick={stopInterview}>
+          <button type="button" onClick={handleEndInterview}>
             End Interview
           </button>
         </p>
       )}
 
+      {status === 'ending' && <p>Wrapping up — scoring your last answer and preparing your report…</p>}
+
       {error && <p className="form-error">{error}</p>}
 
-      {turns.length > 0 && (
+      {(status === 'live' || status === 'ending') && turns.length > 0 && (
         <div className="transcript">
           {turns.map((turn, i) => (
             <p key={i}>
               <strong>{turn.speaker === 'you' ? 'You' : 'Interviewer'}:</strong> {turn.text}
             </p>
           ))}
+        </div>
+      )}
+
+      {status === 'live' && answerScores.length > 0 && (
+        <div className="transcript">
+          <strong>Quick feedback so far:</strong>
+          {answerScores.map((a, i) => (
+            <p key={i}>
+              {typeof a.score === 'number' ? `Score: ${a.score}/10 — ` : ''}
+              {a.quickPointers.join(' · ')}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {status === 'ended' && sessionReport && (
+        <div>
+          <h2>Session Report</h2>
+          <p>
+            <strong>Overall score:</strong>{' '}
+            {sessionReport.overallScore !== null ? `${sessionReport.overallScore}/10` : 'Not enough scored answers'}
+          </p>
+          {sessionReport.overallSummary && <p>{sessionReport.overallSummary}</p>}
+
+          {answerScores.length > 0 && (
+            <>
+              <h3>Per-answer detail</h3>
+              {answerScores.map((a, i) => (
+                <div className="track-card" key={i}>
+                  <p>
+                    <strong>Q:</strong> {a.question || '(question not captured)'}
+                  </p>
+                  <p>
+                    <strong>Your answer:</strong> {a.answer}
+                  </p>
+                  <p>
+                    <strong>Score:</strong> {typeof a.score === 'number' ? `${a.score}/10` : '—'}
+                  </p>
+                  {a.quickPointers.length > 0 && (
+                    <p>
+                      <strong>Quick pointers:</strong> {a.quickPointers.join(' · ')}
+                    </p>
+                  )}
+                  {a.detailedFeedback && (
+                    <p>
+                      <strong>Feedback:</strong> {a.detailedFeedback}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </>
+          )}
+
+          <p>
+            <button type="button" onClick={handleStartAnother}>
+              Start another interview
+            </button>
+          </p>
         </div>
       )}
     </section>

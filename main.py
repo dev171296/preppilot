@@ -25,6 +25,8 @@ from providers import (
     run_stt_test,
     run_realtime_test,
     stream_deepgram_stt,
+    score_interview_answer,
+    score_interview_session_summary,
 )
 
 app = FastAPI(title="PrepPilot API")
@@ -204,6 +206,51 @@ async def api_extract_resume_text(payload: ResumeExtractRequest):
         return {"ok": True, "text": text[:MAX_RESUME_TEXT_CHARS], "truncated": truncated}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+class ScoreAnswerRequest(BaseModel):
+    question: str
+    answer: str
+    company_name: str = ""
+    role_title: str = ""
+    jd_text: str = ""
+
+
+@app.post("/api/score-answer")
+def api_score_answer(payload: ScoreAnswerRequest):
+    """
+    Stage B: rates ONE mock-interview answer via Groq (see providers.py
+    for why Groq, not Gemini). Returns a 1-10 score, a couple of quick
+    pointers meant to show up live right after the answer, and a
+    longer critique saved for the end-of-session report.
+    """
+    if not payload.answer.strip():
+        return {"ok": False, "error": "Empty answer -- nothing to score."}
+    return score_interview_answer(
+        question=payload.question,
+        answer=payload.answer,
+        context={
+            "company_name": payload.company_name,
+            "role_title": payload.role_title,
+            "jd_text": payload.jd_text,
+        },
+    )
+
+
+class ScoreSessionSummaryRequest(BaseModel):
+    answers: list[dict]
+
+
+@app.post("/api/score-session-summary")
+def api_score_session_summary(payload: ScoreSessionSummaryRequest):
+    """
+    Stage B: once a mock interview ends, writes one short overall
+    narrative (strengths/weaknesses/one thing to improve) from all of
+    that session's already-scored answers -- the end-of-session report.
+    """
+    if not payload.answers:
+        return {"ok": False, "error": "No answers to summarize."}
+    return score_interview_session_summary(payload.answers)
 
 
 @app.get("/status", response_class=HTMLResponse)
