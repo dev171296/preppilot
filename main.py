@@ -27,6 +27,7 @@ from providers import (
     stream_deepgram_stt,
     score_interview_answer,
     score_interview_session_summary,
+    generate_live_suggestion,
 )
 
 app = FastAPI(title="PrepPilot API")
@@ -123,6 +124,32 @@ async def ws_stt_stream(websocket: WebSocket, provider_key: str, language: str |
             await websocket.send_text(
                 '{"error": "No live-stream relay wired up for this provider"}'
             )
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_text(f'{{"error": "{type(e).__name__}: {e}"}}')
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/live-copilot-stream")
+async def ws_live_copilot_stream(websocket: WebSocket, language: str | None = None):
+    """
+    Same Deepgram relay as /ws/stt-stream above, but with diarize=true
+    -- this is what tells apart the (real) interviewer's voice from
+    the candidate's in Live Copilot, both coming from one mic. See
+    stream_deepgram_stt's docstring for how the browser resolves which
+    speaker number is "you".
+    """
+    await websocket.accept()
+    try:
+        await stream_deepgram_stt(websocket, language, diarize=True)
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -251,6 +278,35 @@ def api_score_session_summary(payload: ScoreSessionSummaryRequest):
     if not payload.answers:
         return {"ok": False, "error": "No answers to summarize."}
     return score_interview_session_summary(payload.answers)
+
+
+class LiveSuggestionRequest(BaseModel):
+    question: str
+    company_name: str = ""
+    role_title: str = ""
+    jd_text: str = ""
+    resume_text: str = ""
+
+
+@app.post("/api/live-suggestion")
+def api_live_suggestion(payload: LiveSuggestionRequest):
+    """
+    Live Copilot: the (real) interviewer just asked something (per
+    Deepgram diarization on the frontend) -- returns quick pointers +
+    one ready-to-say short answer, grounded in the candidate's
+    resume/JD for this Track. Uses Groq (see providers.py) for speed.
+    """
+    if not payload.question.strip():
+        return {"ok": False, "error": "Empty question -- nothing to suggest for."}
+    return generate_live_suggestion(
+        question=payload.question,
+        context={
+            "company_name": payload.company_name,
+            "role_title": payload.role_title,
+            "jd_text": payload.jd_text,
+            "resume_text": payload.resume_text,
+        },
+    )
 
 
 @app.get("/status", response_class=HTMLResponse)

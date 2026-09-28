@@ -344,6 +344,70 @@ def score_interview_session_summary(answers: list) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# ---------------------------------------------------------------------------
+# Live Interview Copilot -- quick suggested replies (design-scoped 26
+# Sep, built 28 Sep)
+# ---------------------------------------------------------------------------
+# Same reasoning as Stage B scoring: use GROQ, not Gemini, so this
+# never competes with anything else for a shared key's rate limit --
+# and speed matters even more here, since a suggestion needs to show
+# up on screen WHILE the real interview is still happening.
+def generate_live_suggestion(question: str, context: dict) -> dict:
+    """
+    Given something the (real) interviewer just asked, returns a
+    couple of short bullet points to glance at AND one short
+    ready-to-say answer -- both grounded in the candidate's resume/JD
+    context for this Track, same as Stage B's scoring context.
+    """
+    context_lines = []
+    role = context.get("role_title") or ""
+    company = context.get("company_name") or ""
+    if role or company:
+        context_lines.append(f"Role: {role}" + (f" at {company}" if company else ""))
+    if context.get("jd_text"):
+        context_lines.append(f"Job description: {context['jd_text'][:1500]}")
+    if context.get("resume_text"):
+        context_lines.append(f"Candidate resume: {context['resume_text'][:1500]}")
+    context_block = "\n".join(context_lines)
+
+    system_prompt = (
+        "You are silently coaching a candidate DURING a real, live job interview. "
+        "The interviewer just asked something and the candidate needs help RIGHT "
+        "NOW -- be extremely concise, concrete, and grounded in their actual "
+        "background. Respond with ONLY a JSON object, no other text, in exactly "
+        'this shape: {"quick_pointers": [<2 to 3 short bullet phrases, each under '
+        '10 words, key points to hit>], "suggested_answer": "<one short, natural, '
+        'ready-to-say answer, 2-4 sentences>"}'
+    )
+    user_prompt = (
+        (context_block + "\n\n" if context_block else "")
+        + f"The interviewer just asked: {question}"
+    )
+
+    try:
+        client = OpenAI(
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://api.groq.com/openai/v1",
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        resp = client.chat.completions.create(
+            model=SCORING_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        parsed = json.loads(resp.choices[0].message.content)
+        return {
+            "ok": True,
+            "quick_pointers": parsed.get("quick_pointers", []),
+            "suggested_answer": parsed.get("suggested_answer", ""),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 STT_PROVIDERS = {
     "groq_whisper": {
         "label": "Groq (Whisper)",
@@ -599,7 +663,7 @@ def run_realtime_test(provider_key: str) -> dict:
 DEEPGRAM_MODEL = "nova-3"
 
 
-async def stream_deepgram_stt(browser_ws, language: str | None = None) -> None:
+async def stream_deepgram_stt(browser_ws, language: str | None = None, diarize: bool = False) -> None:
     """
     Relays raw 16kHz mono PCM16 audio from the browser (browser_ws, a
     FastAPI WebSocket already accept()-ed by the caller) straight
@@ -612,6 +676,17 @@ async def stream_deepgram_stt(browser_ws, language: str | None = None) -> None:
     Deepgram's "multi" code rather than "hi" -- that's the setting
     Deepgram itself recommends for Hindi/English code-switched
     (Hinglish) speech, not a plain single-language Hindi mode.
+
+    "diarize" (new, for Live Copilot): asks Deepgram to label which
+    of possibly several voices said each word (channel.alternatives[0]
+    .words[i].speaker, an integer). Deepgram doesn't know WHO speaker 0
+    or 1 actually is -- it just keeps voices in one continuous
+    connection consistently separated. The browser side does a short
+    "please say a sentence" calibration right after connecting to work
+    out which speaker number is "you". utterance_end_ms is also turned
+    on here: it's what lets the browser detect "the OTHER person just
+    finished a turn" (via Deepgram's UtteranceEnd message) rather than
+    guessing from silence alone.
     """
     lang = STT_LANGUAGES.get(language, STT_LANGUAGES[DEFAULT_STT_LANGUAGE])
     dg_language = lang.get("deepgram", "en")
@@ -622,6 +697,8 @@ async def stream_deepgram_stt(browser_ws, language: str | None = None) -> None:
         f"?encoding=linear16&sample_rate=16000&model={DEEPGRAM_MODEL}"
         f"&language={dg_language}&interim_results=true&endpointing=300"
     )
+    if diarize:
+        url += "&diarize=true&utterance_end_ms=1000"
 
     async with websockets.connect(
         url, additional_headers={"Authorization": f"Token {api_key}"}

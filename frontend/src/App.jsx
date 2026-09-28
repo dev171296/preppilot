@@ -4,6 +4,7 @@ import Profile from './pages/Profile.jsx'
 import Tracks from './pages/Tracks.jsx'
 import Settings from './pages/Settings.jsx'
 import MockInterview from './pages/MockInterview.jsx'
+import LiveCopilot from './pages/LiveCopilot.jsx'
 import { useAuth } from './lib/AuthContext.jsx'
 import './App.css'
 
@@ -37,6 +38,7 @@ function App() {
           {session && <NavLink to="/tracks">Tracks</NavLink>}
           {isAdmin && <NavLink to="/settings">Settings</NavLink>}
           <NavLink to="/mock-interview">Mock Interview</NavLink>
+          <NavLink to="/live-copilot">Live Copilot</NavLink>
           {session && (
             <button type="button" className="link-button" onClick={signOut}>
               Log out
@@ -52,6 +54,7 @@ function App() {
           <Route path="/tracks" element={<Tracks />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/mock-interview" element={<MockInterview />} />
+          <Route path="/live-copilot" element={<LiveCopilot />} />
         </Routes>
       </main>
     </div>
