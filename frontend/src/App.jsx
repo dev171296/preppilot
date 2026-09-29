@@ -7,6 +7,7 @@ import MockInterview from './pages/MockInterview.jsx'
 import LiveCopilot from './pages/LiveCopilot.jsx'
 import { useAuth } from './lib/AuthContext.jsx'
 import { ADMIN_EMAILS } from './lib/admin.js'
+import RenderStatusBanner from './components/RenderStatusBanner.jsx'
 import './App.css'
 
 /**
@@ -23,6 +24,7 @@ function App() {
 
   return (
     <div className="app-shell">
+      <RenderStatusBanner />
       <header className="top-bar">
         <span className="brand">PrepPilot</span>
         <nav>

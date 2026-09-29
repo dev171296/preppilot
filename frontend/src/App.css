@@ -255,3 +255,12 @@ button:disabled {
   color: #94a3b8;
   font-size: 0.85rem;
 }
+
+.render-status-banner {
+  padding: 0.6rem 1rem;
+  background: #422006;
+  color: #fde68a;
+  border-bottom: 1px solid #92400e;
+  font-size: 0.85rem;
+  text-align: center;
+}
