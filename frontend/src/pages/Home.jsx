@@ -1,7 +1,8 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
+import { ADMIN_EMAILS } from '../lib/admin.js'
 
 /**
  * Home screen. Shows one of three things depending on where the
@@ -32,11 +33,37 @@ function Home() {
     return <DisclaimerGate />
   }
 
+  const isAdmin = ADMIN_EMAILS.includes(session.user.email)
+
   return (
     <section>
       <h1>Welcome back</h1>
       <p>You're signed in as {session.user.email}.</p>
-      <p>There's nothing else here yet — Mock Interview is still a placeholder.</p>
+
+      <div className="shortcut-grid">
+        <Link to="/tracks" className="shortcut-card">
+          <strong>Tracks</strong>
+          <span>Company/role prep, resume &amp; job description</span>
+        </Link>
+        <Link to="/mock-interview" className="shortcut-card">
+          <strong>Mock Interview</strong>
+          <span>Practice with a live AI voice interview + scoring</span>
+        </Link>
+        <Link to="/live-copilot" className="shortcut-card">
+          <strong>Live Copilot</strong>
+          <span>Quick suggested replies during a real interview</span>
+        </Link>
+        <Link to="/profile" className="shortcut-card">
+          <strong>Profile</strong>
+          <span>Your headline &amp; summary</span>
+        </Link>
+        {isAdmin && (
+          <Link to="/settings" className="shortcut-card">
+            <strong>Settings</strong>
+            <span>Provider key vault (admin)</span>
+          </Link>
+        )}
+      </div>
     </section>
   )
 }

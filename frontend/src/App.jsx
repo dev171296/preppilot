@@ -6,13 +6,8 @@ import Settings from './pages/Settings.jsx'
 import MockInterview from './pages/MockInterview.jsx'
 import LiveCopilot from './pages/LiveCopilot.jsx'
 import { useAuth } from './lib/AuthContext.jsx'
+import { ADMIN_EMAILS } from './lib/admin.js'
 import './App.css'
-
-// Kept in sync with the same list in Settings.jsx — only these
-// accounts see the Settings nav link at all (not just blocked from
-// using the page, hidden entirely, since it's not relevant to anyone
-// else).
-const ADMIN_EMAILS = ['fromdevanshu@gmail.com']
 
 /**
  * The app's overall shell: a top bar with the screens we have so far,
@@ -37,8 +32,8 @@ function App() {
           {session && <NavLink to="/profile">Profile</NavLink>}
           {session && <NavLink to="/tracks">Tracks</NavLink>}
           {isAdmin && <NavLink to="/settings">Settings</NavLink>}
-          <NavLink to="/mock-interview">Mock Interview</NavLink>
-          <NavLink to="/live-copilot">Live Copilot</NavLink>
+          {session && <NavLink to="/mock-interview">Mock Interview</NavLink>}
+          {session && <NavLink to="/live-copilot">Live Copilot</NavLink>}
           {session && (
             <button type="button" className="link-button" onClick={signOut}>
               Log out

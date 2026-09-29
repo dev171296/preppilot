@@ -221,3 +221,37 @@ button:disabled {
   line-height: 1.5;
   margin: 0;
 }
+
+.shortcut-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.shortcut-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 1rem;
+  border: 1px solid #1e293b;
+  border-radius: 10px;
+  background: #0f172a;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease;
+}
+
+.shortcut-card:hover {
+  border-color: #3b82f6;
+}
+
+.shortcut-card strong {
+  color: #f8fafc;
+  font-size: 1.05rem;
+}
+
+.shortcut-card span {
+  color: #94a3b8;
+  font-size: 0.85rem;
+}

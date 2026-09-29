@@ -1,12 +1,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
-
-// Only these accounts can see/use this page. There's no proper "roles"
-// system yet (that's more than this needs right now, with one admin) —
-// if PrepPilot ever has other admins, this list is where they'd be added,
-// or it'd be worth replacing with a real is_admin column.
-const ADMIN_EMAILS = ['fromdevanshu@gmail.com']
+import { ADMIN_EMAILS } from '../lib/admin.js'
 
 // Matches the provider keys the backend already reads from Render's
 // environment variables (see providers.py) — kept as a fixed list
