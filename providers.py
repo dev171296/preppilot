@@ -383,6 +383,19 @@ def stream_live_suggestion_chunks(question: str, context: dict):
         context_lines.append(f"Job description: {context['jd_text'][:1500]}")
     if context.get("resume_text"):
         context_lines.append(f"Candidate resume: {context['resume_text'][:1500]}")
+    if context.get("qa_context"):
+        # Pre-matched (on the frontend, by keyword overlap against
+        # this specific question) entries from the candidate's own
+        # Q&A bank -- personal facts/stock answers like "who was your
+        # last client" that don't belong on any one Track. Given
+        # highest priority in the prompt since it's the candidate's
+        # own stated ground truth, not something to improvise around.
+        context_lines.append(
+            "The candidate has pre-written answers to some of their own common "
+            "interview questions -- if any of these match what was just asked, "
+            "use them as the ground truth for the suggested answer:\n"
+            + context["qa_context"][:2000]
+        )
     context_block = "\n".join(context_lines)
 
     system_prompt = (

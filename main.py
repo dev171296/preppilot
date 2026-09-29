@@ -286,6 +286,7 @@ class LiveSuggestionRequest(BaseModel):
     role_title: str = ""
     jd_text: str = ""
     resume_text: str = ""
+    qa_context: str = ""
 
 
 @app.post("/api/live-suggestion")
@@ -311,6 +312,7 @@ def api_live_suggestion(payload: LiveSuggestionRequest):
                 "role_title": payload.role_title,
                 "jd_text": payload.jd_text,
                 "resume_text": payload.resume_text,
+                "qa_context": payload.qa_context,
             },
         ),
         media_type="text/plain",

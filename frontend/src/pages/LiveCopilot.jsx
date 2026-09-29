@@ -11,6 +11,36 @@ const WS_BASE = API_BASE ? API_BASE.replace(/^http/, 'ws') : ''
 const CALIBRATION_MS = 6000
 const QUICK_POINTS_MARKER = 'QUICK POINTS:'
 const SUGGESTED_ANSWER_MARKER = 'SUGGESTED ANSWER:'
+const MAX_QA_MATCHES = 3
+
+// Simple keyword-overlap match, not a real semantic/embedding search
+// -- no extra provider call, no added latency, and good enough for a
+// personal list of a few dozen entries. Counts words (4+ letters, to
+// skip noise like "the"/"and") shared between the interviewer's
+// question and each saved Q&A question; picks the top few with ANY
+// overlap. Good enough to start with (Devanshu's choice, 29 Sep) --
+// worth revisiting with real embeddings if the list grows large or
+// matches feel off in practice.
+function normalizeWords(text) {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 3)
+}
+
+function matchQaEntries(question, qaEntries) {
+  const qWords = new Set(normalizeWords(question))
+  if (qWords.size === 0) return []
+  const scored = qaEntries
+    .map((e) => {
+      const overlap = normalizeWords(e.question).filter((w) => qWords.has(w)).length
+      return { entry: e, overlap }
+    })
+    .filter((s) => s.overlap > 0)
+    .sort((a, b) => b.overlap - a.overlap)
+  return scored.slice(0, MAX_QA_MATCHES).map((s) => s.entry)
+}
 
 // The backend streams plain text in a fixed two-section format (see
 // stream_live_suggestion_chunks in providers.py). This pulls whatever
@@ -48,6 +78,7 @@ function LiveCopilot() {
 
   const [tracks, setTracks] = useState([])
   const [selectedTrackId, setSelectedTrackId] = useState('')
+  const [qaEntries, setQaEntries] = useState([])
   // idle | preparing | calibrating | live | ended
   const [status, setStatus] = useState('idle')
   const [paused, setPaused] = useState(false)
@@ -74,6 +105,12 @@ function LiveCopilot() {
       .order('created_at', { ascending: false })
       .then(({ data, error: fetchError }) => {
         if (!fetchError) setTracks(data || [])
+      })
+    supabase
+      .from('qa_entries')
+      .select('id, question, answer')
+      .then(({ data, error: fetchError }) => {
+        if (!fetchError) setQaEntries(data || [])
       })
   }, [session])
 
@@ -135,6 +172,8 @@ function LiveCopilot() {
 
     let fullText = ''
     try {
+      const matchedQa = matchQaEntries(question, qaEntries)
+      const qaContext = matchedQa.map((e) => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
       const res = await fetch(`${API_BASE}/api/live-suggestion`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -144,6 +183,7 @@ function LiveCopilot() {
           role_title: selectedTrack?.role_title || '',
           jd_text: liveRef.current?.jdText || '',
           resume_text: liveRef.current?.resumeText || '',
+          qa_context: qaContext,
         }),
       })
       const reader = res.body.getReader()

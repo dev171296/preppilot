@@ -15,6 +15,19 @@ const PROVIDERS = [
 
 const STATUSES = ['active', 'standby', 'disabled']
 
+// PrepPilot doesn't track quota/usage itself (most of these
+// providers don't expose a reliable "how much is left" API) --
+// instead this links straight to each provider's own console, where
+// the real, authoritative usage and billing numbers live. Exact
+// in-console page can move around over time; these go to each
+// provider's console/dashboard home.
+const USAGE_LINKS = [
+  { label: 'Gemini (Google AI Studio)', url: 'https://aistudio.google.com/usage' },
+  { label: 'Groq Console', url: 'https://console.groq.com/usage' },
+  { label: 'Deepgram Console', url: 'https://console.deepgram.com/' },
+  { label: 'NVIDIA Build', url: 'https://build.nvidia.com/' },
+]
+
 function maskKey(value) {
   if (!value) return ''
   if (value.length <= 4) return '••••'
@@ -195,6 +208,22 @@ function Settings() {
           </tbody>
         </table>
       )}
+
+      <h2>Usage &amp; billing</h2>
+      <p>
+        PrepPilot doesn't track quota usage itself yet -- these link straight to each
+        provider's own console, where the real numbers (requests, tokens, remaining
+        quota, billing) actually live.
+      </p>
+      <ul>
+        {USAGE_LINKS.map((u) => (
+          <li key={u.url}>
+            <a href={u.url} target="_blank" rel="noreferrer">
+              {u.label}
+            </a>
+          </li>
+        ))}
+      </ul>
     </section>
   )
 }
