@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL
+
 /**
  * The Profile screen — your general bio, not tied to any one company
  * or role. Headline and summary only; target role/company and resume
@@ -97,22 +99,70 @@ function QAEntries({ userId }) {
   const [entries, setEntries] = useState([])
   const [fetching, setFetching] = useState(true)
   const [listError, setListError] = useState(null)
+  const [indexing, setIndexing] = useState(false)
 
   const [question, setQuestion] = useState('')
   const [answer, setAnswer] = useState('')
   const [adding, setAdding] = useState(false)
   const [addError, setAddError] = useState(null)
 
+  // Computes this entry's embedding (a list of numbers capturing its
+  // MEANING, via NVIDIA's hosted embeddings API -- see embed_text()
+  // in providers.py) and saves it on the row, so Live Copilot can
+  // later compare the interviewer's question against it with real
+  // semantic search instead of matching shared words. Best-effort: if
+  // this fails (e.g. a network hiccup), the entry is still saved and
+  // usable, it just won't be eligible for matching until this
+  // succeeds on a later visit to this page.
+  async function embedEntry(entry) {
+    if (!API_BASE) return
+    try {
+      const res = await fetch(`${API_BASE}/api/embed-text`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: `Q: ${entry.question}\nA: ${entry.answer}`,
+          input_type: 'passage',
+        }),
+      })
+      if (!res.ok) return
+      const { embedding } = await res.json()
+      await supabase.from('qa_entries').update({ embedding }).eq('id', entry.id)
+    } catch {
+      // Best-effort, see comment above.
+    }
+  }
+
   async function loadEntries() {
     setFetching(true)
     setListError(null)
     const { data, error } = await supabase
       .from('qa_entries')
-      .select('id, question, answer, created_at')
+      .select('id, question, answer, embedding, created_at')
       .order('created_at', { ascending: true })
-    if (error) setListError(error.message)
-    else setEntries(data)
+    if (error) {
+      setListError(error.message)
+      setFetching(false)
+      return
+    }
+    setEntries(data)
     setFetching(false)
+    // Entries saved before this feature existed (or where the embed
+    // call failed at save time) won't have an embedding yet -- fill
+    // those in quietly in the background so they become matchable.
+    const missing = data.filter((e) => !e.embedding)
+    if (missing.length > 0) {
+      setIndexing(true)
+      for (const entry of missing) {
+        await embedEntry(entry)
+      }
+      setIndexing(false)
+      const { data: refreshed } = await supabase
+        .from('qa_entries')
+        .select('id, question, answer, embedding, created_at')
+        .order('created_at', { ascending: true })
+      if (refreshed) setEntries(refreshed)
+    }
   }
 
   useEffect(() => {
@@ -129,12 +179,15 @@ function QAEntries({ userId }) {
     }
     setAdding(true)
     try {
-      const { error } = await supabase
+      const { data, error } = await supabase
         .from('qa_entries')
         .insert({ user_id: userId, question: question.trim(), answer: answer.trim() })
+        .select()
+        .single()
       if (error) throw error
       setQuestion('')
       setAnswer('')
+      await embedEntry(data)
       await loadEntries()
     } catch (err) {
       setAddError(err.message)
@@ -154,12 +207,13 @@ function QAEntries({ userId }) {
       <p>
         Generic facts and stock answers Live Copilot can pull from — things like "who was
         your last client", "why the gap in your resume", or "what's your notice period".
-        Only the questions closest to what the interviewer actually asks get used each
-        time, so it's fine to add many.
+        Matched by meaning (not just shared words), so it's fine to phrase the interviewer's
+        likely question loosely and add many entries.
       </p>
 
       {listError && <p className="form-error">{listError}</p>}
       {fetching && <p>Loading…</p>}
+      {indexing && <p style={{ fontStyle: 'italic', opacity: 0.7 }}>Preparing smart matching for existing entries…</p>}
 
       {!fetching &&
         entries.map((e) => (

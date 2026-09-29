@@ -10,7 +10,7 @@ import io
 
 import httpx
 from docx2txt import process as extract_docx_text
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
@@ -28,6 +28,7 @@ from providers import (
     score_interview_answer,
     score_interview_session_summary,
     stream_live_suggestion_chunks,
+    embed_text,
 )
 
 app = FastAPI(title="PrepPilot API")
@@ -317,6 +318,33 @@ def api_live_suggestion(payload: LiveSuggestionRequest):
         ),
         media_type="text/plain",
     )
+
+
+class EmbedTextRequest(BaseModel):
+    text: str
+    input_type: str = "query"  # "query" for a live interviewer question, "passage" for a stored Q&A entry
+
+
+@app.post("/api/embed-text")
+def api_embed_text(payload: EmbedTextRequest):
+    """
+    Q&A knowledge bank semantic search (29 Sep 2026 upgrade, replacing
+    keyword-overlap matching). Turns a piece of text into an embedding
+    vector (see embed_text() in providers.py). The frontend calls this
+    once per saved Q&A entry (input_type "passage", result cached in
+    Supabase so it only happens once per entry) and once per
+    interviewer question during a live session (input_type "query",
+    not cached -- it's different every time), then compares vectors
+    with cosine similarity client-side to find the closest matches.
+    """
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    try:
+        embedding = embed_text(text, input_type=payload.input_type)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
+    return {"embedding": embedding}
 
 
 @app.get("/status", response_class=HTMLResponse)

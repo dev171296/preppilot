@@ -13,32 +13,53 @@ const QUICK_POINTS_MARKER = 'QUICK POINTS:'
 const SUGGESTED_ANSWER_MARKER = 'SUGGESTED ANSWER:'
 const MAX_QA_MATCHES = 3
 
-// Simple keyword-overlap match, not a real semantic/embedding search
-// -- no extra provider call, no added latency, and good enough for a
-// personal list of a few dozen entries. Counts words (4+ letters, to
-// skip noise like "the"/"and") shared between the interviewer's
-// question and each saved Q&A question; picks the top few with ANY
-// overlap. Good enough to start with (Devanshu's choice, 29 Sep) --
-// worth revisiting with real embeddings if the list grows large or
-// matches feel off in practice.
-function normalizeWords(text) {
-  return (text || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .filter((w) => w.length > 3)
+// Real semantic search (30 Sep upgrade, replacing keyword-overlap
+// matching). Cosine similarity is the standard way to compare two
+// embedding vectors -- 1 means "same meaning", 0 means "unrelated".
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return 0
+  let dot = 0
+  let normA = 0
+  let normB = 0
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i]
+    normA += a[i] * a[i]
+    normB += b[i] * b[i]
+  }
+  if (normA === 0 || normB === 0) return 0
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB))
 }
 
-function matchQaEntries(question, qaEntries) {
-  const qWords = new Set(normalizeWords(question))
-  if (qWords.size === 0) return []
-  const scored = qaEntries
-    .map((e) => {
-      const overlap = normalizeWords(e.question).filter((w) => qWords.has(w)).length
-      return { entry: e, overlap }
+// Embeds the interviewer's question via NVIDIA's hosted embeddings API
+// (same NVIDIA_API_KEY already configured on Render -- see
+// embed_text() in providers.py) and compares it against each saved
+// Q&A entry's PRE-COMPUTED embedding (computed once when the entry
+// was added in Profile.jsx, cached in Supabase's qa_entries.embedding
+// column). Matches by MEANING, not shared words -- "who was your last
+// client" now matches "tell me about your most recent employer" even
+// though they share no words, unlike the old keyword-overlap version
+// this replaces. Entries that don't have an embedding yet (e.g. added
+// right before this upgrade shipped, still being backfilled) are
+// simply skipped rather than causing an error.
+async function matchQaEntriesSemantic(question, qaEntries) {
+  const withEmbeddings = qaEntries.filter((e) => Array.isArray(e.embedding) && e.embedding.length > 0)
+  if (withEmbeddings.length === 0) return []
+  let questionEmbedding
+  try {
+    const res = await fetch(`${API_BASE}/api/embed-text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: question, input_type: 'query' }),
     })
-    .filter((s) => s.overlap > 0)
-    .sort((a, b) => b.overlap - a.overlap)
+    if (!res.ok) return []
+    const json = await res.json()
+    questionEmbedding = json.embedding
+  } catch {
+    return []
+  }
+  const scored = withEmbeddings
+    .map((e) => ({ entry: e, similarity: cosineSimilarity(questionEmbedding, e.embedding) }))
+    .sort((a, b) => b.similarity - a.similarity)
   return scored.slice(0, MAX_QA_MATCHES).map((s) => s.entry)
 }
 
@@ -108,7 +129,7 @@ function LiveCopilot() {
       })
     supabase
       .from('qa_entries')
-      .select('id, question, answer')
+      .select('id, question, answer, embedding')
       .then(({ data, error: fetchError }) => {
         if (!fetchError) setQaEntries(data || [])
       })
@@ -172,7 +193,7 @@ function LiveCopilot() {
 
     let fullText = ''
     try {
-      const matchedQa = matchQaEntries(question, qaEntries)
+      const matchedQa = await matchQaEntriesSemantic(question, qaEntries)
       const qaContext = matchedQa.map((e) => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
       const res = await fetch(`${API_BASE}/api/live-suggestion`, {
         method: 'POST',

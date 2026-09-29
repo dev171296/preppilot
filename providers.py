@@ -63,6 +63,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import websockets
 from openai import OpenAI
 from google import genai
@@ -438,6 +439,50 @@ def stream_live_suggestion_chunks(question: str, context: dict):
                 yield piece
     except Exception as e:
         yield f"\n[LIVE_SUGGESTION_ERROR: {type(e).__name__}: {e}]"
+
+
+def embed_text(text: str, input_type: str = "query") -> list[float]:
+    """
+    Turns a piece of text into an "embedding" -- a list of numbers that
+    captures its MEANING, not just its words. Two pieces of text that
+    mean similar things end up with similar number-lists even if they
+    share zero words (e.g. "who was your last client" and "tell me
+    about your most recent employer"). This is what makes real semantic
+    search possible, replacing the old keyword-overlap matching for the
+    Q&A knowledge bank (29 Sep 2026 upgrade).
+
+    Uses NVIDIA's HOSTED embeddings API -- the SAME NVIDIA_API_KEY
+    already configured on Render for the other NVIDIA models in this
+    file, no new secret needed. This is the cloud/API call, NOT the
+    self-hosted Docker "NIM" NVIDIA also documents for this model --
+    that one needs your own GPU machine running 24/7, wrong fit here.
+
+    input_type: "query" for a question being asked right now (e.g. the
+    interviewer's live question), "passage" for a stored piece of text
+    (e.g. a saved Q&A entry). This model produces slightly different
+    vectors for each so a short question matches well against longer
+    stored text -- NVIDIA's docs call this an "asymmetric" embedding
+    model. Model/endpoint per https://build.nvidia.com/nvidia/nemotron-3-embed-1b
+    (checked 29 Sep 2026) -- if this starts 404ing, that page is the
+    first place to check for a renamed/replaced model.
+    """
+    resp = httpx.post(
+        "https://integrate.api.nvidia.com/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {os.environ['NVIDIA_API_KEY']}",
+            "Accept": "application/json",
+        },
+        json={
+            "model": "nvidia/nemotron-3-embed-1b",
+            "input": text,
+            "input_type": input_type,
+            "encoding_format": "float",
+            "truncate": "END",
+        },
+        timeout=REQUEST_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
 
 
 STT_PROVIDERS = {
