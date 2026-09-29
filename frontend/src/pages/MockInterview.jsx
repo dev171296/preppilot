@@ -470,7 +470,15 @@ function MockInterview() {
       /* ignore */
     }
     try {
-      state.processor && state.processor.disconnect()
+      if (state.processor) {
+        // Explicitly clearing the callback (not just disconnecting)
+        // works around a Chrome quirk where the deprecated
+        // ScriptProcessorNode API can keep the mic (and the tab's
+        // "mic in use" indicator) alive after End Interview -- same
+        // fix applied to Live Copilot after it was seen there live.
+        state.processor.onaudioprocess = null
+        state.processor.disconnect()
+      }
     } catch (e) {
       /* ignore */
     }

@@ -9,6 +9,29 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL
 const WS_BASE = API_BASE ? API_BASE.replace(/^http/, 'ws') : ''
 
 const CALIBRATION_MS = 6000
+const QUICK_POINTS_MARKER = 'QUICK POINTS:'
+const SUGGESTED_ANSWER_MARKER = 'SUGGESTED ANSWER:'
+
+// The backend streams plain text in a fixed two-section format (see
+// stream_live_suggestion_chunks in providers.py). This pulls whatever
+// has arrived SO FAR apart into {quickPointers, suggestedAnswer} --
+// called on every chunk while streaming, so both sections can visibly
+// grow as text arrives instead of popping in all at once.
+function parseStreamedSuggestion(fullText) {
+  let pointsBlock = fullText
+  let answerBlock = ''
+  const markerIdx = fullText.indexOf(SUGGESTED_ANSWER_MARKER)
+  if (markerIdx !== -1) {
+    pointsBlock = fullText.slice(0, markerIdx)
+    answerBlock = fullText.slice(markerIdx + SUGGESTED_ANSWER_MARKER.length).trim()
+  }
+  pointsBlock = pointsBlock.replace(QUICK_POINTS_MARKER, '').trim()
+  const quickPointers = pointsBlock
+    .split('\n')
+    .map((line) => line.replace(/^[-•]\s*/, '').trim())
+    .filter(Boolean)
+  return { quickPointers, suggestedAnswer: answerBlock }
+}
 
 /**
  * Live Interview Copilot: listens during a REAL interview (not
@@ -16,9 +39,9 @@ const CALIBRATION_MS = 6000
  * interviewer's (Deepgram diarization + a short one-time calibration
  * step), and shows quick suggested replies the moment the interviewer
  * finishes asking something -- silently, text-only, never speaking
- * back. Architecturally different from Mock Interview: there, only
- * your voice ever enters the mic; here, potentially two voices share
- * one mic, so telling them apart is the whole problem.
+ * back. Suggestions stream in live (typed-out, not a sudden
+ * paragraph); the newest suggestion is pinned at the top, visually
+ * separate from earlier ones, so it's easy to glance at mid-call.
  */
 function LiveCopilot() {
   const { session } = useAuth()
@@ -27,12 +50,14 @@ function LiveCopilot() {
   const [selectedTrackId, setSelectedTrackId] = useState('')
   // idle | preparing | calibrating | live | ended
   const [status, setStatus] = useState('idle')
+  const [paused, setPaused] = useState(false)
   const [error, setError] = useState(null)
   const [turns, setTurns] = useState([])
-  const [suggestions, setSuggestions] = useState([]) // {question, quickPointers, suggestedAnswer}
+  const [suggestions, setSuggestions] = useState([]) // {id, question, quickPointers, suggestedAnswer, streaming}
 
   const liveRef = useRef(null)
   const mountedRef = useRef(true)
+  const suggestionIdRef = useRef(0)
 
   useEffect(() => {
     mountedRef.current = true
@@ -100,7 +125,15 @@ function LiveCopilot() {
     }
   }
 
+  // Reads the streamed response chunk by chunk, updating this one
+  // suggestion entry's text as it grows -- this is what makes it
+  // appear "typed" live instead of arriving as one sudden paragraph.
   async function requestSuggestion(question, turnId) {
+    const id = ++suggestionIdRef.current
+    const placeholder = { id, question, quickPointers: [], suggestedAnswer: '', streaming: true }
+    if (mountedRef.current) setSuggestions((prev) => [...prev, placeholder])
+
+    let fullText = ''
     try {
       const res = await fetch(`${API_BASE}/api/live-suggestion`, {
         method: 'POST',
@@ -113,23 +146,35 @@ function LiveCopilot() {
           resume_text: liveRef.current?.resumeText || '',
         }),
       })
-      const json = await res.json()
-      if (!json.ok) return
-      const entry = { question, quickPointers: json.quick_pointers || [], suggestedAnswer: json.suggested_answer || '' }
-      if (mountedRef.current) setSuggestions((prev) => [...prev, entry])
-
-      const sid = liveRef.current?.sessionId
-      if (sid) {
-        const { error: insertError } = await supabase.from('live_suggestions').insert({
-          session_id: sid,
-          turn_id: turnId,
-          quick_pointers: entry.quickPointers,
-          suggested_answer: entry.suggestedAnswer,
-        })
-        if (insertError) console.error('Failed to save suggestion:', insertError.message)
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        fullText += decoder.decode(value, { stream: true })
+        const parsed = parseStreamedSuggestion(fullText)
+        if (mountedRef.current) {
+          setSuggestions((prev) => prev.map((s) => (s.id === id ? { ...s, ...parsed, streaming: true } : s)))
+        }
       }
     } catch (err) {
       console.error('Suggestion error:', err.message)
+    }
+
+    const final = parseStreamedSuggestion(fullText)
+    if (mountedRef.current) {
+      setSuggestions((prev) => prev.map((s) => (s.id === id ? { ...s, ...final, streaming: false } : s)))
+    }
+
+    const sid = liveRef.current?.sessionId
+    if (sid && (final.quickPointers.length > 0 || final.suggestedAnswer)) {
+      const { error: insertError } = await supabase.from('live_suggestions').insert({
+        session_id: sid,
+        turn_id: turnId,
+        quick_pointers: final.quickPointers,
+        suggested_answer: final.suggestedAnswer,
+      })
+      if (insertError) console.error('Failed to save suggestion:', insertError.message)
     }
   }
 
@@ -188,6 +233,7 @@ function LiveCopilot() {
     setError(null)
     setTurns([])
     setSuggestions([])
+    setPaused(false)
     setStatus('preparing')
 
     let resumeText = ''
@@ -230,6 +276,7 @@ function LiveCopilot() {
       calibrating: true,
       calibrationCounts: {},
       currentBuffer: null,
+      paused: false,
     }
     liveRef.current = state
 
@@ -270,6 +317,7 @@ function LiveCopilot() {
       state.processor = processor
 
       processor.onaudioprocess = (e) => {
+        if (state.paused) return
         if (ws.readyState !== WebSocket.OPEN) return
         const input = e.inputBuffer.getChannelData(0)
         const ratio = micCtx.sampleRate / 16000
@@ -311,6 +359,20 @@ function LiveCopilot() {
     if (mountedRef.current) setStatus('live')
   }
 
+  function togglePause() {
+    const state = liveRef.current
+    if (!state) return
+    state.paused = !state.paused
+    setPaused(state.paused)
+  }
+
+  // Pure teardown. The processor's onaudioprocess handler is
+  // explicitly cleared (set to null) BEFORE disconnecting it -- on
+  // some Chrome versions, the deprecated ScriptProcessorNode API keeps
+  // the underlying mic device (and the tab's "mic in use" indicator)
+  // alive until its callback is dropped, not just disconnected. This
+  // was reported live (28 Sep): the Chrome tab still showed the mic as
+  // active after clicking End Session.
   function stopSession() {
     const state = liveRef.current
     if (!state) return
@@ -322,7 +384,10 @@ function LiveCopilot() {
       /* ignore */
     }
     try {
-      state.processor && state.processor.disconnect()
+      if (state.processor) {
+        state.processor.onaudioprocess = null
+        state.processor.disconnect()
+      }
     } catch (e) {
       /* ignore */
     }
@@ -337,7 +402,11 @@ function LiveCopilot() {
       /* ignore */
     }
     try {
-      state.stream && state.stream.getTracks().forEach((t) => t.stop())
+      state.stream &&
+        state.stream.getTracks().forEach((t) => {
+          t.stop()
+          state.stream.removeTrack(t)
+        })
     } catch (e) {
       /* ignore */
     }
@@ -347,6 +416,7 @@ function LiveCopilot() {
   async function handleEndSession() {
     const sid = liveRef.current?.sessionId
     stopSession()
+    setPaused(false)
     if (sid) {
       const { error: updateError } = await supabase
         .from('live_sessions')
@@ -362,7 +432,10 @@ function LiveCopilot() {
     setError(null)
     setTurns([])
     setSuggestions([])
+    setPaused(false)
   }
+
+  const orderedSuggestions = suggestions.slice().reverse()
 
   return (
     <section>
@@ -406,7 +479,11 @@ function LiveCopilot() {
 
       {status === 'live' && (
         <p>
-          🎙️ Listening — quick suggestions will appear below when the interviewer asks something.{' '}
+          {paused ? '⏸️ Paused' : '🎙️ Listening'} — quick suggestions appear below when the interviewer
+          asks something.{' '}
+          <button type="button" onClick={togglePause}>
+            {paused ? 'Resume' : 'Pause'}
+          </button>{' '}
           <button type="button" onClick={handleEndSession}>
             End Session
           </button>
@@ -415,29 +492,30 @@ function LiveCopilot() {
 
       {error && <p className="form-error">{error}</p>}
 
-      {(status === 'live' || status === 'ended') && suggestions.length > 0 && (
-        <div className="transcript">
-          <strong>Suggestions:</strong>
-          {suggestions
-            .slice()
-            .reverse()
-            .map((s, i) => (
-              <div key={i} className="track-card">
-                <p>
-                  <strong>Q:</strong> {s.question}
-                </p>
+      {(status === 'live' || status === 'ended') && orderedSuggestions.length > 0 && (
+        <div>
+          <strong>Suggestions (newest first):</strong>
+          {orderedSuggestions.map((s, i) => {
+            const questionNumber = orderedSuggestions.length - i
+            const isLatest = i === 0
+            return (
+              <div key={s.id} className={isLatest ? 'suggestion-card is-latest' : 'suggestion-card'}>
+                <div className="suggestion-label">
+                  {isLatest ? 'LATEST — ' : ''}Question {questionNumber}
+                  {s.streaming ? ' · typing…' : ''}
+                </div>
+                <p className="suggestion-question">{s.question}</p>
                 {s.quickPointers.length > 0 && (
-                  <p>
-                    <strong>Quick points:</strong> {s.quickPointers.join(' · ')}
-                  </p>
+                  <ul>
+                    {s.quickPointers.map((p, pi) => (
+                      <li key={pi}>{p}</li>
+                    ))}
+                  </ul>
                 )}
-                {s.suggestedAnswer && (
-                  <p>
-                    <strong>Suggested answer:</strong> {s.suggestedAnswer}
-                  </p>
-                )}
+                {s.suggestedAnswer && <p className="suggestion-answer">{s.suggestedAnswer}</p>}
               </div>
-            ))}
+            )
+          })}
         </div>
       )}
 

@@ -12,7 +12,7 @@ import httpx
 from docx2txt import process as extract_docx_text
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from pypdf import PdfReader
 
@@ -27,7 +27,7 @@ from providers import (
     stream_deepgram_stt,
     score_interview_answer,
     score_interview_session_summary,
-    generate_live_suggestion,
+    stream_live_suggestion_chunks,
 )
 
 app = FastAPI(title="PrepPilot API")
@@ -292,20 +292,28 @@ class LiveSuggestionRequest(BaseModel):
 def api_live_suggestion(payload: LiveSuggestionRequest):
     """
     Live Copilot: the (real) interviewer just asked something (per
-    Deepgram diarization on the frontend) -- returns quick pointers +
-    one ready-to-say short answer, grounded in the candidate's
-    resume/JD for this Track. Uses Groq (see providers.py) for speed.
+    Deepgram diarization on the frontend) -- streams back quick
+    pointers + one ready-to-say short answer, grounded in the
+    candidate's resume/JD for this Track, as plain text chunks (see
+    stream_live_suggestion_chunks in providers.py for the exact format
+    and why streaming, not JSON, is used here). The browser reads this
+    response body incrementally and shows it being "typed" live.
     """
     if not payload.question.strip():
-        return {"ok": False, "error": "Empty question -- nothing to suggest for."}
-    return generate_live_suggestion(
-        question=payload.question,
-        context={
-            "company_name": payload.company_name,
-            "role_title": payload.role_title,
-            "jd_text": payload.jd_text,
-            "resume_text": payload.resume_text,
-        },
+        def empty_stream():
+            yield ""
+        return StreamingResponse(empty_stream(), media_type="text/plain")
+    return StreamingResponse(
+        stream_live_suggestion_chunks(
+            question=payload.question,
+            context={
+                "company_name": payload.company_name,
+                "role_title": payload.role_title,
+                "jd_text": payload.jd_text,
+                "resume_text": payload.resume_text,
+            },
+        ),
+        media_type="text/plain",
     )
 
 

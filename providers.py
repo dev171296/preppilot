@@ -352,12 +352,27 @@ def score_interview_session_summary(answers: list) -> dict:
 # never competes with anything else for a shared key's rate limit --
 # and speed matters even more here, since a suggestion needs to show
 # up on screen WHILE the real interview is still happening.
-def generate_live_suggestion(question: str, context: dict) -> dict:
+def stream_live_suggestion_chunks(question: str, context: dict):
     """
-    Given something the (real) interviewer just asked, returns a
-    couple of short bullet points to glance at AND one short
-    ready-to-say answer -- both grounded in the candidate's resume/JD
-    context for this Track, same as Stage B's scoring context.
+    Same job as before (a couple of quick bullet points + one
+    ready-to-say answer for whatever the interviewer just asked), but
+    now STREAMS the reply token-by-token as plain text instead of
+    waiting for one whole JSON object -- so it can show up on screen
+    being "typed" live, the way a real streaming chat reply looks,
+    instead of a full paragraph suddenly appearing (Devanshu's ask,
+    28 Sep, after the first live test).
+
+    This deliberately does NOT use JSON mode any more -- true token
+    streaming and forced JSON output don't mix well (the client can't
+    safely parse a half-arrived JSON object). Instead the model is
+    asked for a fixed plain-text format with two clearly-labeled
+    sections, and the FRONTEND splits the growing text on the
+    "SUGGESTED ANSWER:" marker as it streams in, so both sections can
+    update live.
+
+    A generator, not a normal function -- FastAPI's StreamingResponse
+    reads it chunk by chunk and forwards each piece to the browser
+    immediately, rather than waiting for the whole thing.
     """
     context_lines = []
     role = context.get("role_title") or ""
@@ -374,10 +389,14 @@ def generate_live_suggestion(question: str, context: dict) -> dict:
         "You are silently coaching a candidate DURING a real, live job interview. "
         "The interviewer just asked something and the candidate needs help RIGHT "
         "NOW -- be extremely concise, concrete, and grounded in their actual "
-        "background. Respond with ONLY a JSON object, no other text, in exactly "
-        'this shape: {"quick_pointers": [<2 to 3 short bullet phrases, each under '
-        '10 words, key points to hit>], "suggested_answer": "<one short, natural, '
-        'ready-to-say answer, 2-4 sentences>"}'
+        "background. Respond in EXACTLY this plain-text format, nothing else, no "
+        "markdown, no extra commentary before or after it:\n"
+        "QUICK POINTS:\n"
+        "- <short point, under 10 words>\n"
+        "- <short point, under 10 words>\n"
+        "- <short point, under 10 words>\n"
+        "SUGGESTED ANSWER:\n"
+        "<one short, natural, ready-to-say answer, 2-4 sentences>"
     )
     user_prompt = (
         (context_block + "\n\n" if context_block else "")
@@ -390,22 +409,22 @@ def generate_live_suggestion(question: str, context: dict) -> dict:
             base_url="https://api.groq.com/openai/v1",
             timeout=REQUEST_TIMEOUT_S,
         )
-        resp = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=SCORING_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            response_format={"type": "json_object"},
+            stream=True,
         )
-        parsed = json.loads(resp.choices[0].message.content)
-        return {
-            "ok": True,
-            "quick_pointers": parsed.get("quick_pointers", []),
-            "suggested_answer": parsed.get("suggested_answer", ""),
-        }
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            piece = chunk.choices[0].delta.content
+            if piece:
+                yield piece
     except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        yield f"\n[LIVE_SUGGESTION_ERROR: {type(e).__name__}: {e}]"
 
 
 STT_PROVIDERS = {

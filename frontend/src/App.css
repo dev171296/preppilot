@@ -178,3 +178,46 @@ button:disabled {
 .transcript p {
   margin: 0.4rem 0;
 }
+
+.suggestion-card {
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 0.75rem 0;
+  background: #0f172a;
+}
+
+.suggestion-card.is-latest {
+  border: 2px solid #3b82f6;
+  background: #1e293b;
+}
+
+.suggestion-card .suggestion-label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #60a5fa;
+  margin-bottom: 0.4rem;
+  font-weight: 700;
+}
+
+.suggestion-card .suggestion-question {
+  font-weight: 600;
+  color: #f8fafc;
+  margin: 0 0 0.5rem 0;
+}
+
+.suggestion-card ul {
+  margin: 0 0 0.5rem 0;
+  padding-left: 1.2rem;
+}
+
+.suggestion-card li {
+  margin-bottom: 0.2rem;
+}
+
+.suggestion-card .suggestion-answer {
+  font-size: 1.05rem;
+  line-height: 1.5;
+  margin: 0;
+}
