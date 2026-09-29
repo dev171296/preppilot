@@ -9,6 +9,15 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL
 const WS_BASE = API_BASE ? API_BASE.replace(/^http/, 'ws') : ''
 
 const CALIBRATION_MS = 6000
+
+// Render's free hosting tier sleeps the backend after ~15 min idle.
+// A Live Copilot session can easily sit quietly for longer than that
+// while waiting for the interviewer to actually start talking (mic on,
+// calibrated, just... waiting) -- with no requests going to the
+// backend in that time, it could fall asleep mid-session and then be
+// slow to respond to the first real suggestion. Pinging /health every
+// few minutes for as long as a session is running keeps it warm.
+const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
 const QUICK_POINTS_MARKER = 'QUICK POINTS:'
 const SUGGESTED_ANSWER_MARKER = 'SUGGESTED ANSWER:'
 const MAX_QA_MATCHES = 3
@@ -341,6 +350,16 @@ function LiveCopilot() {
     }
     liveRef.current = state
 
+    // Keep the backend awake for as long as this session runs --
+    // see KEEP_ALIVE_INTERVAL_MS above. Errors here are ignored on
+    // purpose: a failed keep-alive ping just means the NEXT real
+    // request might have to wait through a cold start, same as if
+    // this didn't exist at all -- not something to interrupt the
+    // interview over.
+    state.keepAliveTimer = setInterval(() => {
+      fetch(`${API_BASE}/health`).catch(() => {})
+    }, KEEP_ALIVE_INTERVAL_MS)
+
     try {
       const { data: sessionRow, error: sessionError } = await supabase
         .from('live_sessions')
@@ -396,6 +415,7 @@ function LiveCopilot() {
     } catch (err) {
       setError('Connect error: ' + err.message)
       setStatus('idle')
+      if (state.keepAliveTimer) clearInterval(state.keepAliveTimer)
       try {
         stream.getTracks().forEach((t) => t.stop())
       } catch (e) {
@@ -438,6 +458,7 @@ function LiveCopilot() {
     const state = liveRef.current
     if (!state) return
     if (state.calibrationTimer) clearTimeout(state.calibrationTimer)
+    if (state.keepAliveTimer) clearInterval(state.keepAliveTimer)
     flushCurrentBuffer()
     try {
       state.ws && state.ws.close()
