@@ -27,6 +27,21 @@ const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
 // interviewer still talking while you've paused suggestions) doesn't
 // silently kill the connection.
 const KEEP_ALIVE_WHILE_PAUSED_MS = 4000
+
+// If the connection drops (bad wifi, a few seconds of no internet,
+// etc.), keep retrying rather than giving up -- 2s, 4s, 6s... capped
+// at 15s between tries, forever (until you click End Session). The
+// mic keeps recording the whole time (see bufferAudioChunk below), so
+// nothing said during the gap is lost -- it's sent the moment the
+// connection comes back.
+const RECONNECT_BASE_DELAY_MS = 2000
+const RECONNECT_MAX_DELAY_MS = 15000
+
+// How much audio to hold onto while disconnected before we start
+// dropping the OLDEST of it. 120s is generous for a real connectivity
+// blip without letting memory grow without bound if you're genuinely
+// offline for much longer than that.
+const MAX_BUFFERED_AUDIO_SECONDS = 120
 const QUICK_POINTS_MARKER = 'QUICK POINTS:'
 const SUGGESTED_ANSWER_MARKER = 'SUGGESTED ANSWER:'
 const MAX_QA_MATCHES = 3
@@ -102,6 +117,38 @@ function parseStreamedSuggestion(fullText) {
   return { quickPointers, suggestedAnswer: answerBlock }
 }
 
+// Holds one raw PCM16 audio chunk that couldn't be sent because the
+// connection to the backend was down at the time -- see
+// processor.onaudioprocess below, which calls this instead of
+// silently dropping the audio the way it used to.
+function bufferAudioChunk(state, buffer) {
+  const seconds = buffer.byteLength / 2 / 16000 // 16-bit samples, 16kHz
+  state.pendingAudioChunks.push(buffer)
+  state.pendingAudioSeconds += seconds
+  while (state.pendingAudioSeconds > MAX_BUFFERED_AUDIO_SECONDS && state.pendingAudioChunks.length > 1) {
+    const dropped = state.pendingAudioChunks.shift()
+    state.pendingAudioSeconds -= dropped.byteLength / 2 / 16000
+  }
+}
+
+// Sends everything that piled up while disconnected, in one go, the
+// moment the connection is back -- Deepgram transcribes it in a quick
+// burst rather than real-time, which is what lets you "catch up"
+// instead of losing what was said during the gap.
+function flushPendingAudio(state) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return
+  const chunks = state.pendingAudioChunks
+  state.pendingAudioChunks = []
+  state.pendingAudioSeconds = 0
+  for (const buf of chunks) {
+    try {
+      state.ws.send(buf)
+    } catch (e) {
+      break
+    }
+  }
+}
+
 /**
  * Live Interview Copilot: listens during a REAL interview (not
  * simulated) through one mic, tells your voice apart from the
@@ -111,6 +158,11 @@ function parseStreamedSuggestion(fullText) {
  * back. Suggestions stream in live (typed-out, not a sudden
  * paragraph); the newest suggestion is pinned at the top, visually
  * separate from earlier ones, so it's easy to glance at mid-call.
+ *
+ * If the connection drops for a few seconds (flaky wifi, a brief
+ * outage), it auto-reconnects and replays whatever you said in the
+ * meantime -- see connectWebSocket/scheduleReconnect below -- instead
+ * of resetting the whole session.
  */
 function LiveCopilot() {
   const { session } = useAuth()
@@ -122,6 +174,9 @@ function LiveCopilot() {
   const [status, setStatus] = useState('idle')
   const [paused, setPaused] = useState(false)
   const [error, setError] = useState(null)
+  // connected | reconnecting -- see connectWebSocket/scheduleReconnect
+  const [connectionState, setConnectionState] = useState('connected')
+  const [reconnectAttempt, setReconnectAttempt] = useState(0)
   const [turns, setTurns] = useState([])
   const [suggestions, setSuggestions] = useState([]) // {id, question, quickPointers, suggestedAnswer, streaming}
 
@@ -280,9 +335,10 @@ function LiveCopilot() {
     if (parsed.error) {
       // The backend relayed an error (from Deepgram, or one it hit
       // itself) right before it closes the connection -- show the
-      // real reason instead of letting ws.onclose fall back to a
-      // generic message.
-      state.errorShown = true
+      // real reason. The connection will still auto-reconnect right
+      // after this (ws.onclose fires next), so this message may be
+      // briefly followed by a "retrying" one -- both are informative,
+      // neither needs suppressing.
       if (mountedRef.current) setError('Live listening stopped: ' + parsed.error)
       return
     }
@@ -328,6 +384,8 @@ function LiveCopilot() {
     setTurns([])
     setSuggestions([])
     setPaused(false)
+    setConnectionState('connected')
+    setReconnectAttempt(0)
     setStatus('preparing')
 
     let resumeText = ''
@@ -377,10 +435,14 @@ function LiveCopilot() {
       // just dropped", which previously looked identical and silently
       // dropped you back to the Start Listening screen either way.
       userInitiatedClose: false,
-      // Set once any error has already been shown for this session,
-      // so a generic "connection lost" message doesn't overwrite a
-      // more specific one the backend already sent.
-      errorShown: false,
+      // Raw audio that couldn't be sent while disconnected -- see
+      // bufferAudioChunk/flushPendingAudio above.
+      pendingAudioChunks: [],
+      pendingAudioSeconds: 0,
+      // How many reconnect attempts in a row, and the pending retry
+      // timer -- see scheduleReconnect below.
+      reconnectAttempt: 0,
+      reconnectTimer: null,
     }
     liveRef.current = state
 
@@ -406,39 +468,9 @@ function LiveCopilot() {
       console.error('Could not create live session row:', err.message)
     }
 
+    connectWebSocket(state, false)
+
     try {
-      const ws = new WebSocket(`${WS_BASE}/ws/live-copilot-stream`)
-      state.ws = ws
-      ws.binaryType = 'arraybuffer'
-
-      ws.onopen = () => {
-        setStatus('calibrating')
-        state.calibrationTimer = setTimeout(finishCalibration, CALIBRATION_MS)
-      }
-      ws.onmessage = (event) => handleDeepgramMessage(event.data)
-      ws.onerror = () => {
-        state.errorShown = true
-        setError('Connection to the live-listening service failed.')
-      }
-      // Previously this silently reset back to "Start Listening" with
-      // no explanation whenever the connection dropped mid-session --
-      // which is exactly what made an unexpected drop look like the
-      // whole feature "crashed" with no clue why. Now it only stays
-      // silent when WE closed it on purpose (End Session / leaving the
-      // page); any other close shows a message instead.
-      ws.onclose = () => {
-        if (state.userInitiatedClose) return
-        if (!mountedRef.current) return
-        setStatus('idle')
-        if (!state.errorShown) {
-          setError(
-            'The live-listening connection closed unexpectedly. This can happen if the mic briefly ' +
-              'stopped sending audio (e.g. the tab lost focus) or the connection dropped -- start a new ' +
-              'session to keep going. If this keeps happening, check Render\'s logs around this time.'
-          )
-        }
-      }
-
       const micCtx = new (window.AudioContext || window.webkitAudioContext)()
       const source = micCtx.createMediaStreamSource(stream)
       const processor = micCtx.createScriptProcessor(4096, 1, 1)
@@ -446,9 +478,12 @@ function LiveCopilot() {
       state.source = source
       state.processor = processor
 
+      // Reads state.ws (not a captured local variable) so that when
+      // connectWebSocket swaps in a fresh WebSocket after a reconnect,
+      // this keeps working without the mic/audio graph needing to be
+      // torn down and rebuilt.
       processor.onaudioprocess = (e) => {
         if (state.paused) return
-        if (ws.readyState !== WebSocket.OPEN) return
         const input = e.inputBuffer.getChannelData(0)
         const ratio = micCtx.sampleRate / 16000
         const outLength = Math.floor(input.length / ratio)
@@ -458,14 +493,29 @@ function LiveCopilot() {
           let s = Math.max(-1, Math.min(1, input[srcIndex]))
           pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff
         }
-        ws.send(pcm16.buffer)
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+          state.ws.send(pcm16.buffer)
+        } else {
+          // Connection is down (or still connecting) -- keep the
+          // audio instead of throwing it away; it gets sent the
+          // moment the connection is back. This is the actual fix for
+          // "lost what I said during a connectivity blip."
+          bufferAudioChunk(state, pcm16.buffer)
+        }
       }
       source.connect(processor)
       processor.connect(micCtx.destination)
     } catch (err) {
       setError('Connect error: ' + err.message)
       setStatus('idle')
+      state.userInitiatedClose = true
       if (state.keepAliveTimer) clearInterval(state.keepAliveTimer)
+      if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
+      try {
+        state.ws && state.ws.close()
+      } catch (e) {
+        /* ignore */
+      }
       try {
         stream.getTracks().forEach((t) => t.stop())
       } catch (e) {
@@ -473,6 +523,72 @@ function LiveCopilot() {
       }
       liveRef.current = null
     }
+  }
+
+  // Opens the WebSocket to the backend's Deepgram relay. isReconnect
+  // is false only for the very first connection of a session (which
+  // triggers the "please say a sentence" calibration); every
+  // reconnect after a dropped connection skips calibration -- asking
+  // the interviewer to go quiet on cue mid-interview isn't realistic,
+  // so the existing youSpeakerLabel guess is carried forward instead.
+  // Use Recalibrate if "you"/"interviewer" end up looking swapped
+  // after a reconnect.
+  function connectWebSocket(state, isReconnect) {
+    let ws
+    try {
+      ws = new WebSocket(`${WS_BASE}/ws/live-copilot-stream`)
+    } catch (err) {
+      scheduleReconnect(state)
+      return
+    }
+    state.ws = ws
+    ws.binaryType = 'arraybuffer'
+
+    ws.onopen = () => {
+      state.reconnectAttempt = 0
+      if (isReconnect) {
+        flushPendingAudio(state)
+        if (mountedRef.current) {
+          setConnectionState('connected')
+          setReconnectAttempt(0)
+        }
+      } else {
+        setStatus('calibrating')
+        state.calibrationTimer = setTimeout(finishCalibration, CALIBRATION_MS)
+      }
+    }
+    ws.onmessage = (event) => handleDeepgramMessage(event.data)
+    ws.onerror = () => {
+      // A close event normally follows right away -- the actual retry
+      // happens in onclose below, so a single blip doesn't trigger
+      // two separate reconnect attempts.
+    }
+    // Previously this silently reset back to "Start Listening" with no
+    // explanation whenever the connection dropped mid-session -- which
+    // is exactly what made a brief connectivity blip look like the
+    // whole feature "crashed". Now, unless THIS was a deliberate close
+    // (End Session / leaving the page), it reconnects automatically
+    // instead of giving up.
+    ws.onclose = () => {
+      if (state.userInitiatedClose) return
+      if (liveRef.current !== state) return // this session has already ended/been replaced
+      scheduleReconnect(state)
+    }
+  }
+
+  function scheduleReconnect(state) {
+    if (state.userInitiatedClose) return
+    if (liveRef.current !== state) return
+    state.reconnectAttempt += 1
+    if (mountedRef.current) {
+      setConnectionState('reconnecting')
+      setReconnectAttempt(state.reconnectAttempt)
+    }
+    const delay = Math.min(RECONNECT_BASE_DELAY_MS * state.reconnectAttempt, RECONNECT_MAX_DELAY_MS)
+    state.reconnectTimer = setTimeout(() => {
+      if (liveRef.current !== state) return
+      connectWebSocket(state, true)
+    }, delay)
   }
 
   function finishCalibration() {
@@ -488,6 +604,22 @@ function LiveCopilot() {
     state.youSpeakerLabel = entries.length > 0 ? entries.sort((a, b) => b[1] - a[1])[0][0] : '0'
     state.calibrating = false
     if (mountedRef.current) setStatus('live')
+  }
+
+  // After an unexpected reconnect, the NEW Deepgram connection's
+  // speaker numbering could differ from before -- there's no way to
+  // detect that automatically mid-interview, so this lets you fix it
+  // by hand if "you" and "interviewer" start looking swapped. Same
+  // mechanism as the original calibration, just re-run on demand.
+  function recalibrate() {
+    const state = liveRef.current
+    if (!state) return
+    if (state.calibrationTimer) clearTimeout(state.calibrationTimer)
+    state.calibrating = true
+    state.calibrationCounts = {}
+    state.currentBuffer = null
+    setStatus('calibrating')
+    state.calibrationTimer = setTimeout(finishCalibration, CALIBRATION_MS)
   }
 
   function togglePause() {
@@ -530,6 +662,7 @@ function LiveCopilot() {
     if (state.calibrationTimer) clearTimeout(state.calibrationTimer)
     if (state.keepAliveTimer) clearInterval(state.keepAliveTimer)
     if (state.pauseKeepAliveTimer) clearInterval(state.pauseKeepAliveTimer)
+    if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
     flushCurrentBuffer()
     try {
       state.ws && state.ws.close()
@@ -586,6 +719,8 @@ function LiveCopilot() {
     setTurns([])
     setSuggestions([])
     setPaused(false)
+    setConnectionState('connected')
+    setReconnectAttempt(0)
   }
 
   const orderedSuggestions = suggestions.slice().reverse()
@@ -637,9 +772,19 @@ function LiveCopilot() {
           <button type="button" onClick={togglePause}>
             {paused ? 'Resume' : 'Pause'}
           </button>{' '}
+          <button type="button" onClick={recalibrate}>
+            Recalibrate
+          </button>{' '}
           <button type="button" onClick={handleEndSession}>
             End Session
           </button>
+        </p>
+      )}
+
+      {connectionState === 'reconnecting' && (
+        <p className="form-error">
+          ⚠️ Connection lost — retrying (attempt {reconnectAttempt})… your mic is still recording, nothing
+          you say is being lost, it'll catch up once the connection is back.
         </p>
       )}
 
