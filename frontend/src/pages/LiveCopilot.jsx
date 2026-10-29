@@ -369,6 +369,13 @@ function LiveCopilot() {
       return
     }
 
+    // Tracks whichever OTHER label has actually been heard, so Swap
+    // Speakers (below) can flip to a real, seen label instantly
+    // instead of needing fresh audio the way Recalibrate does.
+    if (speakerLabel !== state.youSpeakerLabel) {
+      state.otherSpeakerLabel = speakerLabel
+    }
+
     const speakerTag = speakerLabel === state.youSpeakerLabel ? 'you' : 'interviewer'
 
     if (state.currentBuffer && state.currentBuffer.speaker === speakerTag) {
@@ -425,6 +432,7 @@ function LiveCopilot() {
       resumeText,
       jdText,
       youSpeakerLabel: null,
+      otherSpeakerLabel: null,
       calibrating: true,
       calibrationCounts: {},
       currentBuffer: null,
@@ -595,13 +603,18 @@ function LiveCopilot() {
     const state = liveRef.current
     if (!state) return
     const counts = state.calibrationCounts
-    const entries = Object.entries(counts)
+    const entries = Object.entries(counts).sort((a, b) => b[1] - a[1])
     // Whichever speaker number said the most during the calibration
     // window (where only the candidate should have been talking) is
     // "you" for the rest of this session. Falls back to "0" if
     // nothing was heard (mic issue) -- not fatal, just means speaker
     // labeling may be off until it self-corrects.
-    state.youSpeakerLabel = entries.length > 0 ? entries.sort((a, b) => b[1] - a[1])[0][0] : '0'
+    state.youSpeakerLabel = entries.length > 0 ? entries[0][0] : '0'
+    // If a second voice was already picked up during calibration too
+    // (e.g. the interviewer said something while you were talking),
+    // Swap Speakers can use it immediately without waiting to hear
+    // them again.
+    state.otherSpeakerLabel = entries.length > 1 ? entries[1][0] : null
     state.calibrating = false
     if (mountedRef.current) setStatus('live')
   }
@@ -620,6 +633,26 @@ function LiveCopilot() {
     state.currentBuffer = null
     setStatus('calibrating')
     state.calibrationTimer = setTimeout(finishCalibration, CALIBRATION_MS)
+  }
+
+  // A faster fix than Recalibrate for the common case (labels just
+  // swapped, e.g. after a reconnect) -- instant, no new "say a
+  // sentence" window, since it just flips to the other label that's
+  // already been heard rather than listening for a fresh one.
+  function swapSpeakers() {
+    const state = liveRef.current
+    if (!state) return
+    if (state.otherSpeakerLabel == null) {
+      if (mountedRef.current) {
+        setError('Swap needs to have heard a second voice at least once first -- try again once the interviewer has spoken.')
+      }
+      return
+    }
+    flushCurrentBuffer() // so the in-progress line isn't split across the swap with the wrong label on each half
+    const prevYou = state.youSpeakerLabel
+    state.youSpeakerLabel = state.otherSpeakerLabel
+    state.otherSpeakerLabel = prevYou
+    if (mountedRef.current) setError(null)
   }
 
   function togglePause() {
@@ -771,6 +804,9 @@ function LiveCopilot() {
           asks something.{' '}
           <button type="button" onClick={togglePause}>
             {paused ? 'Resume' : 'Pause'}
+          </button>{' '}
+          <button type="button" onClick={swapSpeakers}>
+            Swap Speakers
           </button>{' '}
           <button type="button" onClick={recalibrate}>
             Recalibrate
