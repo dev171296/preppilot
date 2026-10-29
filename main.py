@@ -288,6 +288,8 @@ class LiveSuggestionRequest(BaseModel):
     jd_text: str = ""
     resume_text: str = ""
     qa_context: str = ""
+    profile_summary: str = ""  # general bio from the Profile screen, same text Mock Interview uses
+    track_notes: str = ""  # free-text, company/role-specific notes from this Track (see Tracks screen)
 
 
 @app.post("/api/live-suggestion")
@@ -314,6 +316,8 @@ def api_live_suggestion(payload: LiveSuggestionRequest):
                 "jd_text": payload.jd_text,
                 "resume_text": payload.resume_text,
                 "qa_context": payload.qa_context,
+                "profile_summary": payload.profile_summary,
+                "track_notes": payload.track_notes,
             },
         ),
         media_type="text/plain",

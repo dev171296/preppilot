@@ -36,7 +36,7 @@ function Tracks() {
     setListError(null)
     const { data, error } = await supabase
       .from('tracks')
-      .select('id, company_name, role_title, resume_path, jd_text, jd_path, created_at')
+      .select('id, company_name, role_title, resume_path, jd_text, jd_path, notes, created_at')
       .order('created_at', { ascending: false })
     if (error) {
       setListError(error.message)
@@ -155,6 +155,10 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
   const [jdFile, setJdFile] = useState(null)
   const [jdError, setJdError] = useState(null)
 
+  const [notesDraft, setNotesDraft] = useState(track.notes || '')
+  const [notesBusy, setNotesBusy] = useState(false)
+  const [notesError, setNotesError] = useState(null)
+
   useEffect(() => {
     if (!track.resume_path) {
       setResumeUrl(null)
@@ -252,6 +256,29 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
       setJdError(err.message)
     } finally {
       setJdBusy(false)
+    }
+  }
+
+  // Free-text, company/role-SPECIFIC context for this one Track --
+  // things that don't belong in the general Profile summary (which
+  // applies everywhere) or the JD itself, e.g. "they care a lot about
+  // system design, less about LeetCode" or "mention the open-source
+  // project I contributed to that they maintain". Sent to Live
+  // Copilot's suggestion prompt alongside the JD/resume for this Track.
+  async function handleSaveNotes() {
+    setNotesBusy(true)
+    setNotesError(null)
+    try {
+      const { error: trackError } = await supabase
+        .from('tracks')
+        .update({ notes: notesDraft.trim() || null })
+        .eq('id', track.id)
+      if (trackError) throw trackError
+      onChanged()
+    } catch (err) {
+      setNotesError(err.message)
+    } finally {
+      setNotesBusy(false)
     }
   }
 
@@ -400,6 +427,23 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
         </p>
       )}
       {jdError && <p className="form-error">{jdError}</p>}
+
+      <h3 style={{ marginTop: '1rem', marginBottom: '0.4rem', fontSize: '1rem' }}>Notes for this Track (optional)</h3>
+      <label className="auth-form" style={{ marginBottom: '0.4rem' }}>
+        Anything else Live Copilot should know for THIS company/role specifically
+        <textarea
+          rows={3}
+          placeholder="e.g. they focus on system design more than LeetCode; mention the open-source project I contributed to"
+          value={notesDraft}
+          onChange={(e) => setNotesDraft(e.target.value)}
+        />
+      </label>
+      <p>
+        <button type="button" onClick={handleSaveNotes} disabled={notesBusy}>
+          {notesBusy ? 'Saving…' : 'Save notes'}
+        </button>
+      </p>
+      {notesError && <p className="form-error">{notesError}</p>}
     </div>
   )
 }

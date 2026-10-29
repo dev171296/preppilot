@@ -384,6 +384,16 @@ def stream_live_suggestion_chunks(question: str, context: dict):
         context_lines.append(f"Job description: {context['jd_text'][:1500]}")
     if context.get("resume_text"):
         context_lines.append(f"Candidate resume: {context['resume_text'][:1500]}")
+    if context.get("profile_summary"):
+        # General bio from the Profile screen -- not tied to any one
+        # company/role, same text Mock Interview's system instruction
+        # already uses.
+        context_lines.append(f"About the candidate generally: {context['profile_summary'][:1000]}")
+    if context.get("track_notes"):
+        # Free-text notes the candidate wrote specifically for THIS
+        # Track (company/role) -- things that don't belong in the
+        # general Profile summary or the JD itself.
+        context_lines.append(f"Candidate's own notes for this specific company/role: {context['track_notes'][:1000]}")
     if context.get("qa_context"):
         # Pre-matched (on the frontend, by keyword overlap against
         # this specific question) entries from the candidate's own

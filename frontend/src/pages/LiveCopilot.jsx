@@ -165,7 +165,7 @@ function flushPendingAudio(state) {
  * of resetting the whole session.
  */
 function LiveCopilot() {
-  const { session } = useAuth()
+  const { session, profile } = useAuth()
 
   const [tracks, setTracks] = useState([])
   const [selectedTrackId, setSelectedTrackId] = useState('')
@@ -179,6 +179,11 @@ function LiveCopilot() {
   const [reconnectAttempt, setReconnectAttempt] = useState(0)
   const [turns, setTurns] = useState([])
   const [suggestions, setSuggestions] = useState([]) // {id, question, quickPointers, suggestedAnswer, streaming}
+  // The CURRENT, not-yet-flushed speaker turn, shown immediately as
+  // each Deepgram "final" chunk arrives, instead of waiting for a
+  // speaker change/UtteranceEnd to flush the whole turn to `turns`
+  // below -- so the transcript appears live instead of all at once.
+  const [liveLine, setLiveLine] = useState(null) // {speaker, text}
 
   const liveRef = useRef(null)
   const mountedRef = useRef(true)
@@ -195,7 +200,7 @@ function LiveCopilot() {
     if (!session) return
     supabase
       .from('tracks')
-      .select('id, company_name, role_title, resume_path, jd_text, jd_path')
+      .select('id, company_name, role_title, resume_path, jd_text, jd_path, notes')
       .order('created_at', { ascending: false })
       .then(({ data, error: fetchError }) => {
         if (!fetchError) setTracks(data || [])
@@ -278,6 +283,8 @@ function LiveCopilot() {
           jd_text: liveRef.current?.jdText || '',
           resume_text: liveRef.current?.resumeText || '',
           qa_context: qaContext,
+          profile_summary: profile?.summary || '',
+          track_notes: selectedTrack?.notes || '',
         }),
       })
       const reader = res.body.getReader()
@@ -317,6 +324,7 @@ function LiveCopilot() {
     if (!state) return
     const buf = state.currentBuffer
     state.currentBuffer = null
+    if (mountedRef.current) setLiveLine(null)
     if (buf && buf.text.trim()) {
       appendCompletedTurn(buf.speaker, buf.text.trim())
     }
@@ -383,6 +391,11 @@ function LiveCopilot() {
     } else {
       flushCurrentBuffer()
       state.currentBuffer = { speaker: speakerTag, text: alt.transcript }
+    }
+    // Show this chunk on screen right away -- don't wait for the
+    // speaker to change or for UtteranceEnd to flush the full turn.
+    if (mountedRef.current) {
+      setLiveLine({ speaker: state.currentBuffer.speaker, text: state.currentBuffer.text })
     }
   }
 
@@ -853,7 +866,7 @@ function LiveCopilot() {
         </div>
       )}
 
-      {(status === 'live' || status === 'ended') && turns.length > 0 && (
+      {(status === 'live' || status === 'ended') && (turns.length > 0 || liveLine) && (
         <div className="transcript">
           <strong>Transcript:</strong>
           {turns.map((turn, i) => (
@@ -861,6 +874,11 @@ function LiveCopilot() {
               <strong>{turn.speaker === 'you' ? 'You' : 'Interviewer'}:</strong> {turn.text}
             </p>
           ))}
+          {liveLine && (
+            <p style={{ opacity: 0.75 }}>
+              <strong>{liveLine.speaker === 'you' ? 'You' : 'Interviewer'}:</strong> {liveLine.text}
+            </p>
+          )}
         </div>
       )}
 
