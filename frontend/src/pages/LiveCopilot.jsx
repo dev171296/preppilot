@@ -268,6 +268,16 @@ function LiveCopilot() {
       return
     }
 
+    if (parsed.error) {
+      // The backend relayed an error (from Deepgram, or one it hit
+      // itself) right before it closes the connection -- show the
+      // real reason instead of letting ws.onclose fall back to a
+      // generic message.
+      state.errorShown = true
+      if (mountedRef.current) setError('Live listening stopped: ' + parsed.error)
+      return
+    }
+
     if (parsed.type === 'UtteranceEnd') {
       flushCurrentBuffer()
       return
@@ -347,6 +357,16 @@ function LiveCopilot() {
       calibrationCounts: {},
       currentBuffer: null,
       paused: false,
+      // Set right before WE deliberately close the WebSocket (End
+      // Session, or this component unmounting) -- lets ws.onclose
+      // tell apart "you ended this on purpose" from "the connection
+      // just dropped", which previously looked identical and silently
+      // dropped you back to the Start Listening screen either way.
+      userInitiatedClose: false,
+      // Set once any error has already been shown for this session,
+      // so a generic "connection lost" message doesn't overwrite a
+      // more specific one the backend already sent.
+      errorShown: false,
     }
     liveRef.current = state
 
@@ -383,10 +403,26 @@ function LiveCopilot() {
       }
       ws.onmessage = (event) => handleDeepgramMessage(event.data)
       ws.onerror = () => {
+        state.errorShown = true
         setError('Connection to the live-listening service failed.')
       }
+      // Previously this silently reset back to "Start Listening" with
+      // no explanation whenever the connection dropped mid-session --
+      // which is exactly what made an unexpected drop look like the
+      // whole feature "crashed" with no clue why. Now it only stays
+      // silent when WE closed it on purpose (End Session / leaving the
+      // page); any other close shows a message instead.
       ws.onclose = () => {
-        setStatus((s) => (s === 'idle' || s === 'ended' ? s : 'idle'))
+        if (state.userInitiatedClose) return
+        if (!mountedRef.current) return
+        setStatus('idle')
+        if (!state.errorShown) {
+          setError(
+            'The live-listening connection closed unexpectedly. This can happen if the mic briefly ' +
+              'stopped sending audio (e.g. the tab lost focus) or the connection dropped -- start a new ' +
+              'session to keep going. If this keeps happening, check Render\'s logs around this time.'
+          )
+        }
       }
 
       const micCtx = new (window.AudioContext || window.webkitAudioContext)()
@@ -457,6 +493,7 @@ function LiveCopilot() {
   function stopSession() {
     const state = liveRef.current
     if (!state) return
+    state.userInitiatedClose = true
     if (state.calibrationTimer) clearTimeout(state.calibrationTimer)
     if (state.keepAliveTimer) clearInterval(state.keepAliveTimer)
     flushCurrentBuffer()
