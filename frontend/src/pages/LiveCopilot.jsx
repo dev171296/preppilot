@@ -18,6 +18,15 @@ const CALIBRATION_MS = 6000
 // slow to respond to the first real suggestion. Pinging /health every
 // few minutes for as long as a session is running keeps it warm.
 const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
+
+// Deepgram closes a live connection if it gets neither audio NOR a
+// KeepAlive message for 10 seconds straight (its NET-0001 error).
+// Pausing stops us sending audio on purpose -- so while paused, send
+// an explicit KeepAlive text message on this schedule (Deepgram's
+// own docs recommend every 3-5s) so a long Pause (e.g. the
+// interviewer still talking while you've paused suggestions) doesn't
+// silently kill the connection.
+const KEEP_ALIVE_WHILE_PAUSED_MS = 4000
 const QUICK_POINTS_MARKER = 'QUICK POINTS:'
 const SUGGESTED_ANSWER_MARKER = 'SUGGESTED ANSWER:'
 const MAX_QA_MATCHES = 3
@@ -279,6 +288,11 @@ function LiveCopilot() {
     }
 
     if (parsed.type === 'UtteranceEnd') {
+      // Deepgram's own docs: a last_word_end of -1 marks a stale
+      // UtteranceEnd for a result that was already finalized --
+      // acting on it anyway can split one sentence into extra empty
+      // turns. Skip those.
+      if (parsed.last_word_end === -1) return
       flushCurrentBuffer()
       return
     }
@@ -481,6 +495,25 @@ function LiveCopilot() {
     if (!state) return
     state.paused = !state.paused
     setPaused(state.paused)
+
+    if (state.paused) {
+      // See KEEP_ALIVE_WHILE_PAUSED_MS above -- without this, pausing
+      // for 10+ seconds gets the connection killed by Deepgram with no
+      // warning, which is exactly what made this look like a random
+      // crash.
+      state.pauseKeepAliveTimer = setInterval(() => {
+        try {
+          if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+            state.ws.send(JSON.stringify({ type: 'KeepAlive' }))
+          }
+        } catch (e) {
+          /* ignore -- if this fails the connection has bigger problems, ws.onclose will handle it */
+        }
+      }, KEEP_ALIVE_WHILE_PAUSED_MS)
+    } else if (state.pauseKeepAliveTimer) {
+      clearInterval(state.pauseKeepAliveTimer)
+      state.pauseKeepAliveTimer = null
+    }
   }
 
   // Pure teardown. The processor's onaudioprocess handler is
@@ -496,6 +529,7 @@ function LiveCopilot() {
     state.userInitiatedClose = true
     if (state.calibrationTimer) clearTimeout(state.calibrationTimer)
     if (state.keepAliveTimer) clearInterval(state.keepAliveTimer)
+    if (state.pauseKeepAliveTimer) clearInterval(state.pauseKeepAliveTimer)
     flushCurrentBuffer()
     try {
       state.ws && state.ws.close()

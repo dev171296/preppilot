@@ -739,6 +739,12 @@ def run_realtime_test(provider_key: str) -> dict:
 # straight through in both directions for as long as "Listen" is on.
 DEEPGRAM_MODEL = "nova-3"
 
+# See the "utterance_end_ms" note in stream_deepgram_stt's docstring
+# below -- Deepgram's allowed range is 1000-5000ms; 2500 is a middle
+# ground between quick turn-detection and not splitting a single
+# sentence into several on a mid-sentence pause.
+UTTERANCE_END_MS = 2500
+
 
 async def stream_deepgram_stt(browser_ws, language: str | None = None, diarize: bool = False) -> None:
     """
@@ -764,6 +770,17 @@ async def stream_deepgram_stt(browser_ws, language: str | None = None, diarize: 
     on here: it's what lets the browser detect "the OTHER person just
     finished a turn" (via Deepgram's UtteranceEnd message) rather than
     guessing from silence alone.
+
+    utterance_end_ms is set to UTTERANCE_END_MS below rather than
+    Deepgram's floor of 1000ms (29 Oct 2026, after a report that a
+    slow/pausing interviewer's single sentence was getting split into
+    several separate "questions" -- each triggering its own suggestion
+    request). Deepgram's own docs say a value at the 1000ms floor makes
+    a mid-sentence pause more likely to be misread as "they're done
+    talking." A higher value waits longer before deciding someone has
+    finished, trading a little suggestion latency for fewer false
+    splits -- the right tradeoff here since a late-but-correct
+    suggestion beats three fragmented, confusing ones.
     """
     lang = STT_LANGUAGES.get(language, STT_LANGUAGES[DEFAULT_STT_LANGUAGE])
     dg_language = lang.get("deepgram", "en")
@@ -775,7 +792,7 @@ async def stream_deepgram_stt(browser_ws, language: str | None = None, diarize: 
         f"&language={dg_language}&interim_results=true&endpointing=300"
     )
     if diarize:
-        url += "&diarize=true&utterance_end_ms=1000"
+        url += f"&diarize=true&utterance_end_ms={UTTERANCE_END_MS}"
 
     async with websockets.connect(
         url, additional_headers={"Authorization": f"Token {api_key}"}
