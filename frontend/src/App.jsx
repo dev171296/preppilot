@@ -8,6 +8,7 @@ import LiveCopilot from './pages/LiveCopilot.jsx'
 import { useAuth } from './lib/AuthContext.jsx'
 import { ADMIN_EMAILS } from './lib/admin.js'
 import RenderStatusBanner from './components/RenderStatusBanner.jsx'
+import ChatbotWidget from './components/ChatbotWidget.jsx'
 import './App.css'
 
 /**
@@ -54,6 +55,8 @@ function App() {
           <Route path="/live-copilot" element={<LiveCopilot />} />
         </Routes>
       </main>
+
+      <ChatbotWidget />
     </div>
   )
 }
