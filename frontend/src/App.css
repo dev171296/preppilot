@@ -182,8 +182,8 @@ button:disabled {
 .suggestion-card {
   border: 1px solid #1e293b;
   border-radius: 8px;
-  padding: 1rem;
-  margin: 0.75rem 0;
+  padding: 0.6rem 0.75rem;
+  margin: 0.4rem 0;
   background: #0f172a;
 }
 
@@ -192,33 +192,48 @@ button:disabled {
   background: #1e293b;
 }
 
+/* Older questions, shown collapsed (label + question only) so the
+   latest 2 suggestion cards stay fully visible on screen together,
+   on both desktop and mobile widths, without scrolling past them. */
+.suggestion-card-collapsed {
+  padding: 0.35rem 0.75rem;
+  opacity: 0.6;
+}
+
+.suggestion-card-collapsed .suggestion-question {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
 .suggestion-card .suggestion-label {
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: #60a5fa;
-  margin-bottom: 0.4rem;
+  margin-bottom: 0.3rem;
   font-weight: 700;
 }
 
 .suggestion-card .suggestion-question {
   font-weight: 600;
   color: #f8fafc;
-  margin: 0 0 0.5rem 0;
+  margin: 0 0 0.35rem 0;
+  font-size: 0.92rem;
 }
 
 .suggestion-card ul {
-  margin: 0 0 0.5rem 0;
-  padding-left: 1.2rem;
+  margin: 0 0 0.35rem 0;
+  padding-left: 1.1rem;
 }
 
 .suggestion-card li {
-  margin-bottom: 0.2rem;
+  margin-bottom: 0.15rem;
+  font-size: 0.88rem;
 }
 
 .suggestion-card .suggestion-answer {
-  font-size: 1.05rem;
-  line-height: 1.5;
+  font-size: 0.92rem;
+  line-height: 1.35;
   margin: 0;
 }
 

@@ -220,10 +220,14 @@ function LiveCopilot() {
   // speaker change/UtteranceEnd to flush the whole turn to `turns`
   // below -- so the transcript appears live instead of all at once.
   const [liveLine, setLiveLine] = useState(null) // {speaker, text}
+  // Older suggestions collapse by default so the latest 2 always fit
+  // on screen together -- this expands the full history on demand.
+  const [showEarlierSuggestions, setShowEarlierSuggestions] = useState(false)
 
   const liveRef = useRef(null)
   const mountedRef = useRef(true)
   const suggestionIdRef = useRef(0)
+  const turnIdRef = useRef(0)
 
   useEffect(() => {
     mountedRef.current = true
@@ -294,9 +298,14 @@ function LiveCopilot() {
   // the candidate's own record, saved. Interviewer turns additionally
   // trigger a suggestion request.
   async function appendCompletedTurn(speaker, text) {
-    setTurns((prev) => [...prev, { speaker, text }])
+    // A client-side id, separate from the database row's id below --
+    // this is what lets fixLastTurnSpeaker() (further down) find and
+    // remove/retrigger the right suggestion when correcting a
+    // misattributed turn, without waiting on the DB insert.
+    const localTurnId = ++turnIdRef.current
+    setTurns((prev) => [...prev, { speaker, text, localTurnId, dbTurnId: null }])
     const sid = liveRef.current?.sessionId
-    let turnId = null
+    let dbTurnId = null
     if (sid) {
       const { data, error: insertError } = await supabase
         .from('live_turns')
@@ -304,19 +313,60 @@ function LiveCopilot() {
         .select('id')
         .single()
       if (insertError) console.error('Failed to save turn:', insertError.message)
-      else turnId = data.id
+      else {
+        dbTurnId = data.id
+        setTurns((prev) => prev.map((t) => (t.localTurnId === localTurnId ? { ...t, dbTurnId } : t)))
+      }
     }
     if (speaker === 'interviewer') {
-      requestSuggestion(text, turnId)
+      requestSuggestion(text, dbTurnId, localTurnId)
+    }
+  }
+
+  // Deepgram's live diarization has no confidence score to catch this
+  // automatically (checked their docs -- speaker_confidence only
+  // exists for pre-recorded audio, not streaming), so a short
+  // interjection like "okay" right after the interviewer finishes can
+  // get attributed to the wrong speaker with no reliable signal to
+  // detect it. This is the manual fix: flips the LAST completed
+  // turn's speaker. If it's being corrected AWAY from "interviewer",
+  // the suggestion that turn wrongly triggered is removed. If it's
+  // being corrected TO "interviewer" (it really was their question),
+  // a suggestion is requested for it now, since none was triggered
+  // the first time.
+  // NOTE: side effects (the supabase update, possibly requestSuggestion)
+  // deliberately happen OUTSIDE the setTurns updater below -- a setState
+  // updater function should stay pure, since React can invoke it more
+  // than once (e.g. under StrictMode in dev) to check for exactly this.
+  function fixLastTurnSpeaker() {
+    if (turns.length === 0) return
+    const last = turns[turns.length - 1]
+    const flipped = last.speaker === 'you' ? 'interviewer' : 'you'
+    setTurns((prev) => [...prev.slice(0, -1), { ...last, speaker: flipped }])
+
+    if (last.speaker === 'interviewer' && flipped === 'you') {
+      setSuggestions((prev) => prev.filter((s) => s.localTurnId !== last.localTurnId))
+    }
+    if (last.speaker === 'you' && flipped === 'interviewer') {
+      requestSuggestion(last.text, last.dbTurnId, last.localTurnId)
+    }
+    if (last.dbTurnId) {
+      supabase
+        .from('live_turns')
+        .update({ speaker: flipped })
+        .eq('id', last.dbTurnId)
+        .then(({ error: updateError }) => {
+          if (updateError) console.error('Failed to fix turn speaker:', updateError.message)
+        })
     }
   }
 
   // Reads the streamed response chunk by chunk, updating this one
   // suggestion entry's text as it grows -- this is what makes it
   // appear "typed" live instead of arriving as one sudden paragraph.
-  async function requestSuggestion(question, turnId) {
+  async function requestSuggestion(question, turnId, localTurnId) {
     const id = ++suggestionIdRef.current
-    const placeholder = { id, question, quickPointers: [], suggestedAnswer: '', streaming: true }
+    const placeholder = { id, question, quickPointers: [], suggestedAnswer: '', streaming: true, localTurnId }
     if (mountedRef.current) setSuggestions((prev) => [...prev, placeholder])
 
     let fullText = ''
@@ -413,7 +463,7 @@ function LiveCopilot() {
       flushCurrentBuffer()
       return
     }
-    if (parsed.type !== 'Results' || !parsed.is_final) return
+    if (parsed.type !== 'Results') return
 
     const alt = parsed.channel?.alternatives?.[0]
     const words = alt?.words || []
@@ -426,7 +476,12 @@ function LiveCopilot() {
     const speakerLabel = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0]
 
     if (state.calibrating) {
-      state.calibrationCounts[speakerLabel] = (state.calibrationCounts[speakerLabel] || 0) + words.length
+      // Only count FINAL chunks towards calibration -- an interim
+      // result covers the same stretch of speech as the final one
+      // that follows it, so counting both would double-count words.
+      if (parsed.is_final) {
+        state.calibrationCounts[speakerLabel] = (state.calibrationCounts[speakerLabel] || 0) + words.length
+      }
       return
     }
 
@@ -439,6 +494,20 @@ function LiveCopilot() {
 
     const speakerTag = speakerLabel === state.youSpeakerLabel ? 'you' : 'interviewer'
 
+    if (!parsed.is_final) {
+      // Deepgram may still revise this exact text (it's mid-utterance,
+      // not yet finalized) -- show it live, on top of whatever's
+      // already confirmed for this speaker, WITHOUT committing it to
+      // the real transcript yet. This is what makes words appear as
+      // they're actually spoken instead of only once Deepgram decides
+      // the sentence is done.
+      if (mountedRef.current) {
+        const confirmed = state.currentBuffer && state.currentBuffer.speaker === speakerTag ? state.currentBuffer.text + ' ' : ''
+        setLiveLine({ speaker: speakerTag, text: confirmed + alt.transcript, interim: true })
+      }
+      return
+    }
+
     if (state.currentBuffer && state.currentBuffer.speaker === speakerTag) {
       state.currentBuffer.text += ' ' + alt.transcript
     } else {
@@ -448,7 +517,7 @@ function LiveCopilot() {
     // Show this chunk on screen right away -- don't wait for the
     // speaker to change or for UtteranceEnd to flush the full turn.
     if (mountedRef.current) {
-      setLiveLine({ speaker: state.currentBuffer.speaker, text: state.currentBuffer.text })
+      setLiveLine({ speaker: state.currentBuffer.speaker, text: state.currentBuffer.text, interim: false })
     }
   }
 
@@ -456,6 +525,7 @@ function LiveCopilot() {
     setError(null)
     setTurns([])
     setSuggestions([])
+    setShowEarlierSuggestions(false)
     setPaused(false)
     setConnectionState('connected')
     setReconnectAttempt(0)
@@ -817,6 +887,7 @@ function LiveCopilot() {
     setError(null)
     setTurns([])
     setSuggestions([])
+    setShowEarlierSuggestions(false)
     setPaused(false)
     setConnectionState('connected')
     setReconnectAttempt(0)
@@ -895,9 +966,26 @@ function LiveCopilot() {
       {(status === 'live' || status === 'ended') && orderedSuggestions.length > 0 && (
         <div>
           <strong>Suggestions (newest first):</strong>
+          {/* Always show the latest 2 in full (compact styling, see
+              App.css) so both fit on screen together without scrolling
+              -- older ones collapse to a one-line summary behind a
+              toggle, since mid-interview you mainly need THIS and the
+              PREVIOUS question, not the full history at once. */}
           {orderedSuggestions.map((s, i) => {
             const questionNumber = orderedSuggestions.length - i
             const isLatest = i === 0
+            const isRecent = i < 2
+            if (!isRecent && !showEarlierSuggestions) {
+              return null
+            }
+            if (!isRecent) {
+              return (
+                <div key={s.id} className="suggestion-card suggestion-card-collapsed">
+                  <div className="suggestion-label">Question {questionNumber}</div>
+                  <p className="suggestion-question">{s.question}</p>
+                </div>
+              )
+            }
             return (
               <div key={s.id} className={isLatest ? 'suggestion-card is-latest' : 'suggestion-card'}>
                 <div className="suggestion-label">
@@ -916,6 +1004,11 @@ function LiveCopilot() {
               </div>
             )
           })}
+          {orderedSuggestions.length > 2 && (
+            <button type="button" className="link-button" onClick={() => setShowEarlierSuggestions((v) => !v)}>
+              {showEarlierSuggestions ? 'Hide earlier questions' : `Show ${orderedSuggestions.length - 2} earlier question${orderedSuggestions.length - 2 === 1 ? '' : 's'}`}
+            </button>
+          )}
         </div>
       )}
 
@@ -928,8 +1021,15 @@ function LiveCopilot() {
             </p>
           ))}
           {liveLine && (
-            <p style={{ opacity: 0.75 }}>
+            <p style={{ opacity: liveLine.interim ? 0.55 : 0.8, fontStyle: liveLine.interim ? 'italic' : 'normal' }}>
               <strong>{liveLine.speaker === 'you' ? 'You' : 'Interviewer'}:</strong> {liveLine.text}
+            </p>
+          )}
+          {turns.length > 0 && status === 'live' && (
+            <p style={{ marginTop: '0.3rem' }}>
+              <button type="button" className="link-button" onClick={fixLastTurnSpeaker}>
+                Wrong speaker on the last line? Fix it
+              </button>
             </p>
           )}
         </div>

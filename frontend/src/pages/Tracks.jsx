@@ -235,6 +235,29 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
     if (!countError) setKnowledgeChunkCount(count || 0)
   }
 
+  // The actual chunk TEXT, only fetched when you open the viewer below
+  // -- not needed just to show the count, and could be a lot of text
+  // for a big knowledge base.
+  const [knowledgeChunksView, setKnowledgeChunksView] = useState(null)
+  const [knowledgeChunksExpanded, setKnowledgeChunksExpanded] = useState(false)
+  const [knowledgeChunksLoading, setKnowledgeChunksLoading] = useState(false)
+
+  async function toggleKnowledgeChunksView() {
+    if (knowledgeChunksExpanded) {
+      setKnowledgeChunksExpanded(false)
+      return
+    }
+    setKnowledgeChunksExpanded(true)
+    setKnowledgeChunksLoading(true)
+    const { data, error: fetchError } = await supabase
+      .from('track_knowledge_chunks')
+      .select('id, chunk_index, chunk_text')
+      .eq('track_id', track.id)
+      .order('chunk_index', { ascending: true })
+    if (!fetchError) setKnowledgeChunksView(data || [])
+    setKnowledgeChunksLoading(false)
+  }
+
   useEffect(() => {
     loadKnowledgeChunkCount()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -283,6 +306,8 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
       }
 
       setKnowledgeDraft('')
+      setKnowledgeChunksView(null)
+      setKnowledgeChunksExpanded(false)
       await loadKnowledgeChunkCount()
     } catch (err) {
       setKnowledgeError(err.message)
@@ -301,6 +326,8 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
         .delete()
         .eq('track_id', track.id)
       if (deleteError) throw deleteError
+      setKnowledgeChunksView(null)
+      setKnowledgeChunksExpanded(false)
       await loadKnowledgeChunkCount()
     } catch (err) {
       setKnowledgeError(err.message)
@@ -607,7 +634,42 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
           : knowledgeChunkCount > 0
             ? `✓ Indexed: ${knowledgeChunkCount} chunk${knowledgeChunkCount === 1 ? '' : 's'}`
             : 'Not indexed yet.'}
+        {knowledgeChunkCount > 0 && (
+          <>
+            {' · '}
+            <button type="button" className="link-button" onClick={toggleKnowledgeChunksView}>
+              {knowledgeChunksExpanded ? 'Hide chunks' : 'View chunks'}
+            </button>
+          </>
+        )}
       </p>
+      {knowledgeChunksExpanded && (
+        <div
+          style={{
+            maxHeight: '260px',
+            overflowY: 'auto',
+            border: '1px solid #334155',
+            borderRadius: '6px',
+            padding: '0.5rem',
+            marginBottom: '0.6rem',
+          }}
+        >
+          {knowledgeChunksLoading && <p>Loading chunks…</p>}
+          {!knowledgeChunksLoading && knowledgeChunksView && knowledgeChunksView.length === 0 && (
+            <p>No chunks found.</p>
+          )}
+          {!knowledgeChunksLoading &&
+            knowledgeChunksView &&
+            knowledgeChunksView.map((chunk) => (
+              <div key={chunk.id} style={{ marginBottom: '0.6rem', paddingBottom: '0.6rem', borderBottom: '1px solid #1e293b' }}>
+                <div style={{ color: '#94a3b8', fontSize: '0.78rem', marginBottom: '0.2rem' }}>
+                  Chunk {chunk.chunk_index + 1}
+                </div>
+                <div style={{ fontSize: '0.85rem', whiteSpace: 'pre-wrap' }}>{chunk.chunk_text}</div>
+              </div>
+            ))}
+        </div>
+      )}
       <label className="auth-form" style={{ marginBottom: '0.4rem' }}>
         Paste knowledge base text (replaces whatever's indexed now)
         <textarea
