@@ -45,6 +45,11 @@ const MAX_BUFFERED_AUDIO_SECONDS = 120
 const QUICK_POINTS_MARKER = 'QUICK POINTS:'
 const SUGGESTED_ANSWER_MARKER = 'SUGGESTED ANSWER:'
 const MAX_QA_MATCHES = 3
+// How many of this Track's knowledge-base chunks (see Tracks.jsx's
+// "Knowledge base" section) to pull in per question -- kept small
+// since these get sent on every live suggestion request, same
+// reasoning as MAX_QA_MATCHES above.
+const MAX_TRACK_KNOWLEDGE_MATCHES = 4
 
 // Real semantic search (30 Sep upgrade, replacing keyword-overlap
 // matching). Cosine similarity is the standard way to compare two
@@ -94,6 +99,33 @@ async function matchQaEntriesSemantic(question, qaEntries) {
     .map((e) => ({ entry: e, similarity: cosineSimilarity(questionEmbedding, e.embedding) }))
     .sort((a, b) => b.similarity - a.similarity)
   return scored.slice(0, MAX_QA_MATCHES).map((s) => s.entry)
+}
+
+// Same idea as matchQaEntriesSemantic above, but over this Track's
+// (possibly very large) knowledge base instead of the global Q&A
+// bank -- each chunk was embedded once when it was indexed in
+// Tracks.jsx, so this is just comparing against already-computed
+// vectors, one embedding call for the question itself.
+async function matchTrackKnowledgeSemantic(question, chunks) {
+  const withEmbeddings = chunks.filter((c) => Array.isArray(c.embedding) && c.embedding.length > 0)
+  if (withEmbeddings.length === 0) return []
+  let questionEmbedding
+  try {
+    const res = await fetch(`${API_BASE}/api/embed-text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: question, input_type: 'query' }),
+    })
+    if (!res.ok) return []
+    const json = await res.json()
+    questionEmbedding = json.embedding
+  } catch {
+    return []
+  }
+  const scored = withEmbeddings
+    .map((c) => ({ chunk: c, similarity: cosineSimilarity(questionEmbedding, c.embedding) }))
+    .sort((a, b) => b.similarity - a.similarity)
+  return scored.slice(0, MAX_TRACK_KNOWLEDGE_MATCHES).map((s) => s.chunk)
 }
 
 // The backend streams plain text in a fixed two-section format (see
@@ -170,6 +202,10 @@ function LiveCopilot() {
   const [tracks, setTracks] = useState([])
   const [selectedTrackId, setSelectedTrackId] = useState('')
   const [qaEntries, setQaEntries] = useState([])
+  // This Track's knowledge-base chunks (see Tracks.jsx), refetched
+  // whenever the selected Track changes -- only the few most
+  // relevant ones get sent per question, via matchTrackKnowledgeSemantic.
+  const [trackKnowledgeChunks, setTrackKnowledgeChunks] = useState([])
   // idle | preparing | calibrating | live | ended
   const [status, setStatus] = useState('idle')
   const [paused, setPaused] = useState(false)
@@ -225,6 +261,20 @@ function LiveCopilot() {
 
   const selectedTrack = tracks.find((t) => t.id === selectedTrackId)
 
+  useEffect(() => {
+    if (!selectedTrackId) {
+      setTrackKnowledgeChunks([])
+      return
+    }
+    supabase
+      .from('track_knowledge_chunks')
+      .select('id, chunk_text, embedding')
+      .eq('track_id', selectedTrackId)
+      .then(({ data, error: fetchError }) => {
+        if (!fetchError) setTrackKnowledgeChunks(data || [])
+      })
+  }, [selectedTrackId])
+
   async function extractFileText(path) {
     if (!path) return ''
     const { data, error: urlError } = await supabase.storage.from('resumes').createSignedUrl(path, 300)
@@ -273,6 +323,8 @@ function LiveCopilot() {
     try {
       const matchedQa = await matchQaEntriesSemantic(question, qaEntries)
       const qaContext = matchedQa.map((e) => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
+      const matchedKnowledge = await matchTrackKnowledgeSemantic(question, trackKnowledgeChunks)
+      const knowledgeContext = matchedKnowledge.map((c) => c.chunk_text).join('\n\n')
       const res = await fetch(`${API_BASE}/api/live-suggestion`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -285,6 +337,7 @@ function LiveCopilot() {
           qa_context: qaContext,
           profile_summary: profile?.summary || '',
           track_notes: selectedTrack?.notes || '',
+          knowledge_context: knowledgeContext,
         }),
       })
       const reader = res.body.getReader()

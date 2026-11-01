@@ -394,6 +394,18 @@ def stream_live_suggestion_chunks(question: str, context: dict):
         # Track (company/role) -- things that don't belong in the
         # general Profile summary or the JD itself.
         context_lines.append(f"Candidate's own notes for this specific company/role: {context['track_notes'][:1000]}")
+    if context.get("knowledge_context"):
+        # The frontend already ran semantic search over this Track's
+        # (possibly very large, 100k+ character) knowledge base and
+        # picked only the few chunks most relevant to THIS question
+        # (see matchTrackKnowledgeSemantic in LiveCopilot.jsx) -- this
+        # is already a short, targeted excerpt, not the whole thing,
+        # so the cap here is just a safety net, not expected to bite.
+        context_lines.append(
+            "Relevant background/reference material for this specific company/role "
+            "(ground the suggested answer in these real facts/specifics where relevant):\n"
+            + context["knowledge_context"][:6000]
+        )
     if context.get("qa_context"):
         # Pre-matched (on the frontend, by keyword overlap against
         # this specific question) entries from the candidate's own

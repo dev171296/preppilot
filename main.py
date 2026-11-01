@@ -290,6 +290,7 @@ class LiveSuggestionRequest(BaseModel):
     qa_context: str = ""
     profile_summary: str = ""  # general bio from the Profile screen, same text Mock Interview uses
     track_notes: str = ""  # free-text, company/role-specific notes from this Track (see Tracks screen)
+    knowledge_context: str = ""  # top-matching chunks from this Track's knowledge base (see track_knowledge_chunks), already picked by the frontend via semantic search -- NOT the whole knowledge base
 
 
 @app.post("/api/live-suggestion")
@@ -318,6 +319,7 @@ def api_live_suggestion(payload: LiveSuggestionRequest):
                 "qa_context": payload.qa_context,
                 "profile_summary": payload.profile_summary,
                 "track_notes": payload.track_notes,
+                "knowledge_context": payload.knowledge_context,
             },
         ),
         media_type="text/plain",

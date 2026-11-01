@@ -2,12 +2,70 @@ import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL
+
 const MAX_RESUME_BYTES = 5 * 1024 * 1024 // 5 MB — matches the Supabase Storage bucket's own limit
 
 const ALLOWED_RESUME_TYPES = {
   'application/pdf': 'pdf',
   'application/msword': 'doc',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+}
+
+// Target size for one knowledge-base chunk, in words. Big enough to
+// hold a full Q&A pair or a self-contained paragraph of context,
+// small enough that Live Copilot's top-4 matches (see LiveCopilot.jsx's
+// MAX_TRACK_KNOWLEDGE_MATCHES) stay a reasonable size to send on every
+// live suggestion request.
+const KNOWLEDGE_CHUNK_TARGET_WORDS = 300
+
+// Splits a large pasted block of text (could be 100k+ characters) into
+// chunks small enough to embed and retrieve individually -- the same
+// idea as the existing Q&A bank's per-entry embeddings, just applied
+// to freeform text instead of discrete Q&A pairs. Splits on blank
+// lines first (so it doesn't cut a paragraph or a "Q: ... A: ..." pair
+// in half where avoidable), then groups consecutive paragraphs together
+// until the target word count is reached.
+function chunkKnowledgeText(text) {
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+  const chunks = []
+  let current = []
+  let currentWords = 0
+
+  function flush() {
+    if (current.length > 0) {
+      chunks.push(current.join('\n\n'))
+      current = []
+      currentWords = 0
+    }
+  }
+
+  for (const para of paragraphs) {
+    const paraWords = para.split(/\s+/).filter(Boolean)
+    if (paraWords.length > KNOWLEDGE_CHUNK_TARGET_WORDS) {
+      // This ONE paragraph alone is already bigger than a whole
+      // chunk (e.g. a big pasted block with no blank lines at all) --
+      // flush whatever's pending, then split this paragraph itself
+      // into target-sized word groups. Can't preserve its internal
+      // structure here, but the alternative (one giant unsplit
+      // chunk) would defeat the whole point of chunking.
+      flush()
+      for (let i = 0; i < paraWords.length; i += KNOWLEDGE_CHUNK_TARGET_WORDS) {
+        chunks.push(paraWords.slice(i, i + KNOWLEDGE_CHUNK_TARGET_WORDS).join(' '))
+      }
+      continue
+    }
+    if (currentWords > 0 && currentWords + paraWords.length > KNOWLEDGE_CHUNK_TARGET_WORDS) {
+      flush()
+    }
+    current.push(para)
+    currentWords += paraWords.length
+  }
+  flush()
+  return chunks
 }
 
 /**
@@ -158,6 +216,98 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
   const [notesDraft, setNotesDraft] = useState(track.notes || '')
   const [notesBusy, setNotesBusy] = useState(false)
   const [notesError, setNotesError] = useState(null)
+
+  // Large (100k+ character) pasted knowledge base for this Track --
+  // split into chunks and embedded once here, then Live Copilot pulls
+  // only the few most relevant chunks per question (semantic search),
+  // instead of this whole thing being resent on every suggestion.
+  const [knowledgeDraft, setKnowledgeDraft] = useState('')
+  const [knowledgeBusy, setKnowledgeBusy] = useState(false)
+  const [knowledgeError, setKnowledgeError] = useState(null)
+  const [knowledgeProgress, setKnowledgeProgress] = useState(null) // {done, total}
+  const [knowledgeChunkCount, setKnowledgeChunkCount] = useState(null)
+
+  async function loadKnowledgeChunkCount() {
+    const { count, error: countError } = await supabase
+      .from('track_knowledge_chunks')
+      .select('id', { count: 'exact', head: true })
+      .eq('track_id', track.id)
+    if (!countError) setKnowledgeChunkCount(count || 0)
+  }
+
+  useEffect(() => {
+    loadKnowledgeChunkCount()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [track.id])
+
+  // Replaces this Track's ENTIRE knowledge base with whatever's in the
+  // textarea right now: deletes old chunks, splits the new text, and
+  // embeds each chunk one at a time (same NVIDIA embedding call the
+  // Q&A bank already uses). This happens once here, not per question
+  // -- that's the whole point versus just stuffing it in the Notes
+  // field, which gets resent on every single live suggestion.
+  async function handleIndexKnowledge() {
+    const text = knowledgeDraft.trim()
+    if (!text) {
+      setKnowledgeError('Paste some text first.')
+      return
+    }
+    setKnowledgeBusy(true)
+    setKnowledgeError(null)
+    try {
+      const chunks = chunkKnowledgeText(text)
+      setKnowledgeProgress({ done: 0, total: chunks.length })
+
+      const { error: deleteError } = await supabase
+        .from('track_knowledge_chunks')
+        .delete()
+        .eq('track_id', track.id)
+      if (deleteError) throw deleteError
+
+      for (let i = 0; i < chunks.length; i++) {
+        const res = await fetch(`${API_BASE}/api/embed-text`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: chunks[i], input_type: 'passage' }),
+        })
+        if (!res.ok) throw new Error(`Failed to embed chunk ${i + 1} of ${chunks.length}`)
+        const { embedding } = await res.json()
+        const { error: insertError } = await supabase.from('track_knowledge_chunks').insert({
+          track_id: track.id,
+          chunk_index: i,
+          chunk_text: chunks[i],
+          embedding,
+        })
+        if (insertError) throw insertError
+        setKnowledgeProgress({ done: i + 1, total: chunks.length })
+      }
+
+      setKnowledgeDraft('')
+      await loadKnowledgeChunkCount()
+    } catch (err) {
+      setKnowledgeError(err.message)
+    } finally {
+      setKnowledgeBusy(false)
+      setKnowledgeProgress(null)
+    }
+  }
+
+  async function handleClearKnowledge() {
+    setKnowledgeBusy(true)
+    setKnowledgeError(null)
+    try {
+      const { error: deleteError } = await supabase
+        .from('track_knowledge_chunks')
+        .delete()
+        .eq('track_id', track.id)
+      if (deleteError) throw deleteError
+      await loadKnowledgeChunkCount()
+    } catch (err) {
+      setKnowledgeError(err.message)
+    } finally {
+      setKnowledgeBusy(false)
+    }
+  }
 
   useEffect(() => {
     if (!track.resume_path) {
@@ -444,6 +594,44 @@ function TrackCard({ track, userId, onChanged, onDelete }) {
         </button>
       </p>
       {notesError && <p className="form-error">{notesError}</p>}
+
+      <h3 style={{ marginTop: '1rem', marginBottom: '0.4rem', fontSize: '1rem' }}>Knowledge base (optional)</h3>
+      <p style={{ color: '#94a3b8', fontSize: '0.85rem', marginBottom: '0.4rem' }}>
+        For a LOT of context for this company/role -- Q&amp;A pairs, research, docs, anything you want Live
+        Copilot to draw on. Unlike Notes above (sent in full every time), this gets split into pieces and only
+        the most relevant pieces are pulled in for each question -- so paste as much as you want.
+      </p>
+      <p style={{ marginBottom: '0.4rem' }}>
+        {knowledgeChunkCount === null
+          ? 'Checking…'
+          : knowledgeChunkCount > 0
+            ? `✓ Indexed: ${knowledgeChunkCount} chunk${knowledgeChunkCount === 1 ? '' : 's'}`
+            : 'Not indexed yet.'}
+      </p>
+      <label className="auth-form" style={{ marginBottom: '0.4rem' }}>
+        Paste knowledge base text (replaces whatever's indexed now)
+        <textarea
+          rows={6}
+          placeholder="Paste as much as you want -- Q&amp;A pairs, company research, product docs…"
+          value={knowledgeDraft}
+          onChange={(e) => setKnowledgeDraft(e.target.value)}
+        />
+      </label>
+      <p>
+        <button type="button" onClick={handleIndexKnowledge} disabled={knowledgeBusy}>
+          {knowledgeProgress
+            ? `Indexing ${knowledgeProgress.done}/${knowledgeProgress.total}…`
+            : knowledgeBusy
+              ? 'Indexing…'
+              : 'Save & index'}
+        </button>{' '}
+        {knowledgeChunkCount > 0 && (
+          <button type="button" className="link-button" onClick={handleClearKnowledge} disabled={knowledgeBusy}>
+            Clear knowledge base
+          </button>
+        )}
+      </p>
+      {knowledgeError && <p className="form-error">{knowledgeError}</p>}
     </div>
   )
 }
