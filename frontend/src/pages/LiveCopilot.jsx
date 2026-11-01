@@ -289,9 +289,20 @@ function LiveCopilot() {
 
     let fullText = ''
     try {
-      const matchedQa = await matchQaEntriesSemantic(API_BASE, question, qaEntries)
+      // Run both lookups in parallel (2 Nov latency fix) instead of
+      // one-after-the-other -- they're independent, so awaiting them
+      // sequentially was paying for two full network round-trips back
+      // to back before the suggestion could even start. { rerank:
+      // false } skips the extra LLM reranking round-trip entirely --
+      // see matchTrackKnowledgeSemantic's useRerank comment -- since a
+      // real interview can't afford that latency the way testing in
+      // the Chatbot widget can; the hybrid (semantic+keyword via RRF)
+      // order is still used, just without the extra LLM pass on top.
+      const [matchedQa, matchedKnowledge] = await Promise.all([
+        matchQaEntriesSemantic(API_BASE, question, qaEntries),
+        matchTrackKnowledgeSemantic(API_BASE, question, trackKnowledgeChunks, { rerank: false }),
+      ])
       const qaContext = matchedQa.map((e) => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
-      const matchedKnowledge = await matchTrackKnowledgeSemantic(API_BASE, question, trackKnowledgeChunks)
       const knowledgeContext = matchedKnowledge.map((c) => c.chunk_text).join('\n\n')
       const res = await fetch(`${API_BASE}/api/live-suggestion`, {
         method: 'POST',

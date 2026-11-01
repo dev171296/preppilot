@@ -160,6 +160,17 @@ export async function matchTrackKnowledgeSemantic(apiBase, question, chunks, opt
   // what's shown to the reranker, not the rewritten blob. Defaults to
   // `question` itself, so existing callers (Live Copilot) are unaffected.
   const displayQuestion = opts.rerankQuestion || question
+  // rerank: whether to make the extra LLM reranking call at all (2 Nov
+  // latency fix). Live Copilot passes { rerank: false } -- during a
+  // REAL interview, every suggestion already waits on 2 embedding
+  // calls before it can even start streaming; the rerank call is a
+  // THIRD network round-trip (a full, non-streamed LLM completion,
+  // not just a quick lookup) that Devanshu reported made Live
+  // Copilot noticeably slower, while the Chatbot widget (not latency-
+  // sensitive -- it's a testing tool) felt fine with it. Defaults to
+  // true so the Chatbot widget's quality-over-speed behavior is
+  // unchanged; Live Copilot opts out explicitly instead.
+  const useRerank = opts.rerank !== false
   const withEmbeddings = chunks.filter((c) => Array.isArray(c.embedding) && c.embedding.length > 0)
   if (withEmbeddings.length === 0) return []
   let questionEmbedding
@@ -228,22 +239,24 @@ export async function matchTrackKnowledgeSemantic(apiBase, question, chunks, opt
   // call fails for any reason, rather than losing the suggestion over it.
   const candidatePool = merged.slice(0, KB_RERANK_POOL_SIZE)
   let rerankedIndices = []
-  try {
-    const res = await fetch(`${apiBase}/api/rerank-chunks`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question: displayQuestion,
-        candidates: candidatePool.map((s) => s.chunk.chunk_text),
-        top_n: MAX_TRACK_KNOWLEDGE_MATCHES,
-      }),
-    })
-    if (res.ok) {
-      const rerankJson = await res.json()
-      if (Array.isArray(rerankJson.indices)) rerankedIndices = rerankJson.indices
+  if (useRerank) {
+    try {
+      const res = await fetch(`${apiBase}/api/rerank-chunks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: displayQuestion,
+          candidates: candidatePool.map((s) => s.chunk.chunk_text),
+          top_n: MAX_TRACK_KNOWLEDGE_MATCHES,
+        }),
+      })
+      if (res.ok) {
+        const rerankJson = await res.json()
+        if (Array.isArray(rerankJson.indices)) rerankedIndices = rerankJson.indices
+      }
+    } catch {
+      // Network hiccup -- candidatePool (RRF order) below covers it.
     }
-  } catch {
-    // Network hiccup -- candidatePool (RRF order) below covers it.
   }
 
   const selected =

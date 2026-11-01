@@ -916,10 +916,28 @@ async def stream_deepgram_stt(browser_ws, language: str | None = None, diarize: 
     url = (
         "wss://api.deepgram.com/v1/listen"
         f"?encoding=linear16&sample_rate=16000&model={DEEPGRAM_MODEL}"
-        f"&language={dg_language}&interim_results=true&endpointing=300"
+        f"&interim_results=true&endpointing=300"
     )
     if diarize:
+        # Live Copilot (2 Nov fix): Devanshu has NO control over which
+        # language the real interviewer speaks -- English, Hindi, or
+        # Hinglish (code-switched) -- and the frontend has no language
+        # picker for this screen anyway, so `language` here was always
+        # just defaulting to "en" (DEFAULT_STT_LANGUAGE), silently
+        # forcing English-only transcription no matter what was
+        # actually said. Deepgram's own docs confirm `language=multi`
+        # (nova-3's multilingual mode) supports English natively too,
+        # not just when mixed with another language, and recommend it
+        # specifically for Hindi/English code-switched speech (checked
+        # 2 Nov 2026: developers.deepgram.com/docs/nova-3-language-prompting).
+        # `language_hint` biases detection toward the given languages
+        # WITHOUT restricting it to only those -- so this doesn't break
+        # anything if the interview turns out to be some other language
+        # entirely, it just won't be specially favored.
+        url += "&language=multi&language_hint=en&language_hint=hi"
         url += f"&diarize=true&utterance_end_ms={UTTERANCE_END_MS}"
+    else:
+        url += f"&language={dg_language}"
 
     async with websockets.connect(
         url, additional_headers={"Authorization": f"Token {api_key}"}
