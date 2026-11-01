@@ -353,7 +353,11 @@ def score_interview_session_summary(answers: list) -> dict:
 # never competes with anything else for a shared key's rate limit --
 # and speed matters even more here, since a suggestion needs to show
 # up on screen WHILE the real interview is still happening.
-def stream_live_suggestion_chunks(question: str, context: dict):
+# How many of the conversation's prior turns to actually include (2 Nov, Chatbot-widget conversational-memory pass) -- caps the prompt size for a long test chat; 6 messages is 3 full exchanges, plenty for a follow-up like "and if I missed it?" to still make sense.
+CONVERSATION_HISTORY_LIMIT = 6
+
+
+def stream_live_suggestion_chunks(question: str, context: dict, conversation_history: list[dict] | None = None):
     """
     Same job as before (a couple of quick bullet points + one
     ready-to-say answer for whatever the interviewer just asked), but
@@ -459,6 +463,21 @@ def stream_live_suggestion_chunks(question: str, context: dict):
         + f"The interviewer just asked: {question}"
     )
 
+    # Prior turns (Chatbot widget only -- see conversation_history's
+    # docstring note in LiveSuggestionRequest) are sent as REAL separate
+    # chat messages, not crammed into one block of text, so the model
+    # actually sees this as an ongoing conversation rather than a pile
+    # of unrelated context. Only the last CONVERSATION_HISTORY_LIMIT
+    # messages are kept, and each is capped in length so one long prior
+    # answer can't crowd out everything else.
+    messages = [{"role": "system", "content": system_prompt}]
+    for turn in (conversation_history or [])[-CONVERSATION_HISTORY_LIMIT:]:
+        role = "assistant" if turn.get("role") == "assistant" else "user"
+        content = (turn.get("content") or "").strip()
+        if content:
+            messages.append({"role": role, "content": content[:1500]})
+    messages.append({"role": "user", "content": user_prompt})
+
     try:
         client = OpenAI(
             api_key=os.environ["GROQ_API_KEY"],
@@ -467,10 +486,7 @@ def stream_live_suggestion_chunks(question: str, context: dict):
         )
         stream = client.chat.completions.create(
             model=SCORING_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
             stream=True,
         )
         for chunk in stream:

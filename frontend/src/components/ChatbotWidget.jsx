@@ -9,6 +9,13 @@ import {
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL
 
+// How many of the conversation's own prior messages to send to the
+// backend as real chat turns (2 Nov, after Devanshu reported the
+// widget "does not remember the previous interaction") -- 6 messages
+// is 3 full exchanges, enough for a natural follow-up without letting
+// the prompt grow unbounded over a long test session.
+const CONVERSATION_HISTORY_LIMIT = 6
+
 /**
  * A small floating "test chatbot" -- a round icon pinned to the
  * bottom-right corner of every screen that expands into a chat panel.
@@ -22,10 +29,54 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL
  * text actually being used?" was to run a full live mic session.
  * This gives a much faster way to poke at the same pipeline directly.
  *
+ * 2 Nov: actually conversational now -- recent turns are sent to the
+ * backend as real chat messages (see conversation_history in
+ * providers.py's stream_live_suggestion_chunks) so a follow-up like
+ * "and if I missed the deadline?" gets answered as a follow-up. The
+ * question used for RETRIEVAL (finding relevant chunks/Q&A) is also
+ * widened with recent context -- see buildRetrievalQuery below -- so
+ * a vague follow-up can still find the right material, while the
+ * ORIGINAL question (not the widened one) is still what gets shown to
+ * the reranker and sent as "the interviewer just asked" to the LLM.
+ *
  * On purpose NOT wired to any backend chat-history table -- this is a
  * scratch testing tool, so history is plain React state that clears
- * on refresh.
+ * on refresh (conversational memory lasts the session, not forever).
  */
+
+// Turns this widget's own message list into the {role, content} shape
+// the backend expects, oldest first, capped to the last N. Only
+// completed (non-streaming) assistant turns are included -- including
+// one still mid-stream would send a half-finished answer as if it
+// were final.
+function buildConversationHistory(priorMessages) {
+  const history = []
+  for (const m of priorMessages) {
+    if (m.role === 'user' && m.text) {
+      history.push({ role: 'user', content: m.text })
+    } else if (m.role === 'assistant' && !m.streaming && m.suggestedAnswer) {
+      history.push({ role: 'assistant', content: m.suggestedAnswer })
+    }
+  }
+  return history.slice(-CONVERSATION_HISTORY_LIMIT)
+}
+
+// A simple, rule-based query rewrite for RETRIEVAL only (not for what's
+// shown to the model as "the question"): folds the last exchange into
+// the embedding text so a short follow-up ("and the gold one?", "what
+// about after 7 days?") has enough words in it to actually match the
+// right chunk, instead of being searched on its own three words. This
+// is the RAG doc's "small model or rules for rewriting" option --
+// rules chosen here over an extra LLM call to keep this fast.
+function buildRetrievalQuery(priorMessages, question) {
+  const lastUser = [...priorMessages].reverse().find((m) => m.role === 'user')
+  const lastAssistant = [...priorMessages].reverse().find((m) => m.role === 'assistant' && !m.streaming && m.suggestedAnswer)
+  const parts = []
+  if (lastUser) parts.push(lastUser.text)
+  if (lastAssistant) parts.push(lastAssistant.suggestedAnswer)
+  parts.push(question)
+  return parts.join('\n')
+}
 function ChatbotWidget() {
   const { session, profile } = useAuth()
   const [open, setOpen] = useState(false)
@@ -97,6 +148,13 @@ function ChatbotWidget() {
     setInput('')
     setSending(true)
 
+    // Captured BEFORE this turn's messages are appended below, so it's
+    // genuinely "everything before this question" -- used for both the
+    // backend conversation_history and the retrieval query rewrite.
+    const priorMessages = messages
+    const conversationHistory = buildConversationHistory(priorMessages)
+    const retrievalQuery = buildRetrievalQuery(priorMessages, question)
+
     const userMsgId = ++messageIdRef.current
     const assistantMsgId = ++messageIdRef.current
     setMessages((prev) => [
@@ -107,21 +165,34 @@ function ChatbotWidget() {
 
     let fullText = ''
     try {
+      // QA matching uses the question as typed -- saved Q&A entries are
+      // themselves short standalone questions, so widening the query
+      // with prior turns tends to hurt that match more than help it.
       const matchedQa = await matchQaEntriesSemantic(API_BASE, question, qaEntries)
       const qaContext = matchedQa.map((e) => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
-      const matchedKnowledge = await matchTrackKnowledgeSemantic(API_BASE, question, trackKnowledgeChunks)
+      // Knowledge-base matching uses the WIDENED query for retrieval
+      // (so a short follow-up can still find the right chunk) but the
+      // ORIGINAL question for the reranker (see rerankQuestion in
+      // matchTrackKnowledgeSemantic) and everything else downstream.
+      const matchedKnowledge = await matchTrackKnowledgeSemantic(API_BASE, retrievalQuery, trackKnowledgeChunks, {
+        rerankQuestion: question,
+      })
       const knowledgeContext = matchedKnowledge.map((c) => c.chunk_text).join('\n\n')
 
-      // Show exactly what retrieval picked for this question -- the
-      // whole point of this widget (2 Nov RAG-quality pass) is to make
-      // "is my context actually being used, and is it the RIGHT
-      // context" something you can actually see, not just guess at.
-      // Shown before the answer even starts streaming, since this is
-      // already known at this point.
+      // Show EVERY context source actually sent for this question, not
+      // just KB/Q&A -- Devanshu correctly flagged that a correct answer
+      // could come from Notes/JD/Profile summary, which weren't shown
+      // here before, making "none of the shown chunks had that info"
+      // look like a retrieval bug when it was really a visibility gap.
+      const contextUsed = {
+        qa: matchedQa,
+        knowledge: matchedKnowledge,
+        notes: selectedTrack?.notes || '',
+        jd: selectedTrack?.jd_text || '',
+        profileSummary: profile?.summary || '',
+      }
       if (mountedRef.current) {
-        setMessages((prev) =>
-          prev.map((m) => (m.id === assistantMsgId ? { ...m, contextUsed: { qa: matchedQa, knowledge: matchedKnowledge } } : m))
-        )
+        setMessages((prev) => prev.map((m) => (m.id === assistantMsgId ? { ...m, contextUsed } : m)))
       }
       const res = await fetch(`${API_BASE}/api/live-suggestion`, {
         method: 'POST',
@@ -136,6 +207,7 @@ function ChatbotWidget() {
           profile_summary: profile?.summary || '',
           track_notes: selectedTrack?.notes || '',
           knowledge_context: knowledgeContext,
+          conversation_history: conversationHistory,
         }),
       })
       const reader = res.body.getReader()
@@ -206,8 +278,9 @@ function ChatbotWidget() {
             {messages.length === 0 && (
               <p className="chatbot-hint">
                 Type a question below to see exactly what Live Copilot would suggest for it -- same
-                grounding (resume/JD/notes/knowledge base/saved Q&amp;A), same format. Good for testing
-                whether a Track's context is actually being used, without running a live session.
+                grounding (resume/JD/notes/knowledge base/saved Q&amp;A), same format. Remembers this
+                conversation (follow-ups like "and if I missed it?" work), and shows exactly what
+                context was used for each answer below it.
               </p>
             )}
             {messages.map((m) =>
@@ -228,14 +301,40 @@ function ChatbotWidget() {
                   {m.streaming && !m.suggestedAnswer && (!m.quickPointers || m.quickPointers.length === 0) && (
                     <p className="chatbot-hint">Thinking...</p>
                   )}
-                  {m.contextUsed && (m.contextUsed.qa.length > 0 || m.contextUsed.knowledge.length > 0) && (
+                  {m.contextUsed && (
                     <details className="chatbot-context-used">
                       <summary>
-                        Context used ({m.contextUsed.qa.length} Q&amp;A, {m.contextUsed.knowledge.length} knowledge-base)
+                        Context used ({m.contextUsed.qa.length} Q&amp;A, {m.contextUsed.knowledge.length} knowledge-base
+                        {m.contextUsed.notes ? ', notes' : ''}
+                        {m.contextUsed.jd ? ', JD' : ''}
+                        {m.contextUsed.profileSummary ? ', profile' : ''})
                       </summary>
+                      {/* Every source actually sent with this question, not just KB/Q&A --
+                          a correct answer can come from Notes/JD/Profile just as validly. */}
+                      {m.contextUsed.notes && (
+                        <div className="chatbot-context-item">
+                          <span className="chatbot-context-score">Track notes (sent in full, not chunked)</span>
+                          <p>{m.contextUsed.notes.slice(0, 220)}{m.contextUsed.notes.length > 220 ? '…' : ''}</p>
+                        </div>
+                      )}
+                      {m.contextUsed.jd && (
+                        <div className="chatbot-context-item">
+                          <span className="chatbot-context-score">Job description (sent in full, not chunked)</span>
+                          <p>{m.contextUsed.jd.slice(0, 220)}{m.contextUsed.jd.length > 220 ? '…' : ''}</p>
+                        </div>
+                      )}
+                      {m.contextUsed.profileSummary && (
+                        <div className="chatbot-context-item">
+                          <span className="chatbot-context-score">Profile summary (sent in full, not chunked)</span>
+                          <p>{m.contextUsed.profileSummary.slice(0, 220)}{m.contextUsed.profileSummary.length > 220 ? '…' : ''}</p>
+                        </div>
+                      )}
                       {m.contextUsed.knowledge.map((c, i) => (
                         <div key={`k${i}`} className="chatbot-context-item">
-                          <span className="chatbot-context-score">KB · similarity {c._similarity.toFixed(2)}</span>
+                          <span className="chatbot-context-score">
+                            KB · semantic {c._similarity.toFixed(2)}
+                            {c._keywordScore > 0 ? ` · keyword ${c._keywordScore.toFixed(1)}` : ''}
+                          </span>
                           <p>{c.chunk_text.slice(0, 220)}{c.chunk_text.length > 220 ? '…' : ''}</p>
                         </div>
                       ))}
@@ -245,10 +344,12 @@ function ChatbotWidget() {
                           <p>{e.question}</p>
                         </div>
                       ))}
+                      {m.contextUsed.qa.length === 0 &&
+                        m.contextUsed.knowledge.length === 0 &&
+                        !m.contextUsed.notes &&
+                        !m.contextUsed.jd &&
+                        !m.contextUsed.profileSummary && <p className="chatbot-hint">No context was available or relevant for this question (general knowledge only).</p>}
                     </details>
-                  )}
-                  {m.contextUsed && m.contextUsed.qa.length === 0 && m.contextUsed.knowledge.length === 0 && !m.streaming && (
-                    <p className="chatbot-hint">No saved Q&amp;A or knowledge-base match cleared the relevance threshold for this question.</p>
                   )}
                 </div>
               )

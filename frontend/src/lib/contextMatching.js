@@ -29,12 +29,16 @@ export const MAX_TRACK_KNOWLEDGE_MATCHES = 8
 // questions, which is the right way to tune this number with real
 // data instead of guessing further.
 export const MIN_SIMILARITY = 0.15
-// How many cosine-shortlisted candidates to hand to the backend's
-// second-pass reranker (see matchTrackKnowledgeSemantic below) --
-// kept well above MAX_TRACK_KNOWLEDGE_MATCHES so the reranker has
-// real choices to make, but capped so the rerank call itself (one
-// extra LLM round-trip) stays small and fast.
+// How many candidates to hand to the backend's second-pass reranker
+// (see matchTrackKnowledgeSemantic below) after the hybrid merge --
+// kept well above MAX_TRACK_KNOWLEDGE_MATCHES so the reranker has real
+// choices to make, but capped so the rerank call itself (one extra
+// LLM round-trip) stays small and fast.
 export const KB_RERANK_POOL_SIZE = 12
+// How many candidates EACH of the two retrieval methods (semantic,
+// keyword) contributes before they're merged (2 Nov hybrid-search
+// pass, following T11's "retrieve wide, then narrow" pattern).
+export const HYBRID_SHORTLIST_SIZE = 20
 
 // Real semantic search (30 Sep upgrade, replacing keyword-overlap
 // matching). Cosine similarity is the standard way to compare two
@@ -51,6 +55,57 @@ export function cosineSimilarity(a, b) {
   }
   if (normA === 0 || normB === 0) return 0
   return dot / (Math.sqrt(normA) * Math.sqrt(normB))
+}
+
+function tokenize(text) {
+  return (text.toLowerCase().match(/[a-z0-9]+/g) || [])
+}
+
+// Simplified TF-IDF-style keyword relevance (2 Nov hybrid-search pass,
+// following the "semantic + keyword, merged" pattern from the RAG
+// best-practices doc Devanshu shared: semantic search is weak on EXACT
+// terms -- a specific code, acronym or product name -- when the
+// surrounding wording differs enough that the embeddings don't end up
+// close, even though the literal word is right there in both texts.
+// Keyword overlap catches that directly. This isn't true BM25 (no
+// document-length normalization), but captures the same core idea:
+// a shared RARE term counts for more than a shared common one.
+function keywordScores(queryText, chunkTexts) {
+  const queryTokens = [...new Set(tokenize(queryText))]
+  if (queryTokens.length === 0) return chunkTexts.map(() => 0)
+  const chunkTokenLists = chunkTexts.map(tokenize)
+  const n = chunkTokenLists.length
+  const docFreq = {}
+  for (const token of queryTokens) {
+    docFreq[token] = chunkTokenLists.filter((toks) => toks.includes(token)).length
+  }
+  return chunkTokenLists.map((toks) => {
+    let score = 0
+    for (const token of queryTokens) {
+      const count = toks.filter((t) => t === token).length
+      if (count === 0) continue
+      const idf = Math.log((n + 1) / (docFreq[token] + 1)) + 1
+      score += count * idf
+    }
+    return score
+  })
+}
+
+// Reciprocal Rank Fusion -- the doc's recommended default way to merge
+// two ranked lists ("rank-based, no tuning", vs. weighted blending
+// which needs per-query tuning to get right). A candidate's combined
+// score is the sum of 1/(60+rank) across every list it appears in; 60
+// is RRF's own standard constant, not something to tune per question.
+// A candidate that ranks well in BOTH lists beats one that only one
+// method liked.
+function reciprocalRankFusion(rankedKeyLists) {
+  const scores = new Map()
+  for (const keys of rankedKeyLists) {
+    keys.forEach((key, rank) => {
+      scores.set(key, (scores.get(key) || 0) + 1 / (60 + rank))
+    })
+  }
+  return scores
 }
 
 // Embeds the interviewer's question via NVIDIA's hosted embeddings API
@@ -96,7 +151,15 @@ export async function matchQaEntriesSemantic(apiBase, question, qaEntries) {
 // bank -- each chunk was embedded once when it was indexed in
 // Tracks.jsx, so this is just comparing against already-computed
 // vectors, one embedding call for the question itself.
-export async function matchTrackKnowledgeSemantic(apiBase, question, chunks) {
+export async function matchTrackKnowledgeSemantic(apiBase, question, chunks, opts = {}) {
+  // rerankQuestion/displayQuestion: when the caller rewrote `question`
+  // into something longer for embedding purposes (e.g. the Chatbot
+  // widget folding in recent conversation so "and the gold one?"
+  // actually embeds as something findable -- see buildRetrievalQuery
+  // in ChatbotWidget.jsx), the REAL current question should still be
+  // what's shown to the reranker, not the rewritten blob. Defaults to
+  // `question` itself, so existing callers (Live Copilot) are unaffected.
+  const displayQuestion = opts.rerankQuestion || question
   const withEmbeddings = chunks.filter((c) => Array.isArray(c.embedding) && c.embedding.length > 0)
   if (withEmbeddings.length === 0) return []
   let questionEmbedding
@@ -112,28 +175,65 @@ export async function matchTrackKnowledgeSemantic(apiBase, question, chunks) {
   } catch {
     return []
   }
-  const scored = withEmbeddings
-    .map((c) => ({ chunk: c, similarity: cosineSimilarity(questionEmbedding, c.embedding) }))
-    .filter((s) => s.similarity >= MIN_SIMILARITY)
-    .sort((a, b) => b.similarity - a.similarity)
-  if (scored.length === 0) return []
 
-  // Stage 1 (above) is cosine similarity over embeddings -- fast, but
-  // not always great at telling "topically related" apart from
-  // "actually answers this question" once there are several
-  // plausible candidates. Stage 2: hand the top candidate pool to the
-  // backend's rerank_chunks() (an LLM read of the real question
-  // against each candidate) to pick the genuinely best ones. If the
-  // rerank call fails or returns nothing usable, fall back to plain
-  // cosine order rather than losing the suggestion entirely over it.
-  const candidatePool = scored.slice(0, KB_RERANK_POOL_SIZE)
+  // Hybrid search (2 Nov, following the shared RAG best-practices doc's
+  // T11): two independent rankings over the SAME chunks -- semantic
+  // (meaning, via embeddings) and keyword (exact terms, via a simple
+  // TF-IDF-style score) -- since each catches relevant chunks the other
+  // can miss. Neither list alone decides what's "in"; a chunk only
+  // needs to rank well on EITHER to reach the merge step below.
+  const semanticRanked = withEmbeddings
+    .map((c) => ({ chunk: c, similarity: cosineSimilarity(questionEmbedding, c.embedding) }))
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, HYBRID_SHORTLIST_SIZE)
+  const kwScores = keywordScores(question, withEmbeddings.map((c) => c.chunk_text))
+  const keywordRanked = withEmbeddings
+    .map((c, i) => ({ chunk: c, keywordScore: kwScores[i] }))
+    .filter((s) => s.keywordScore > 0)
+    .sort((a, b) => b.keywordScore - a.keywordScore)
+    .slice(0, HYBRID_SHORTLIST_SIZE)
+  if (semanticRanked.length === 0 && keywordRanked.length === 0) return []
+
+  // Merge via Reciprocal Rank Fusion. Note there's no MIN_SIMILARITY
+  // floor applied here any more -- a chunk that's a strong KEYWORD
+  // match (an exact code/term) but only a mediocre semantic one is
+  // exactly the case hybrid search exists to rescue (see T11); cutting
+  // it on cosine alone would defeat the point. The real relevance gate
+  // is the reranker below, which can -- and is instructed to --
+  // return nothing if genuinely none of the candidates are relevant.
+  const semanticByKey = new Map(semanticRanked.map((s) => [s.chunk.id, s]))
+  const keywordByKey = new Map(keywordRanked.map((s) => [s.chunk.id, s]))
+  const rrfScores = reciprocalRankFusion([
+    semanticRanked.map((s) => s.chunk.id),
+    keywordRanked.map((s) => s.chunk.id),
+  ])
+  const merged = [...rrfScores.entries()]
+    .map(([id, rrf]) => {
+      const sEntry = semanticByKey.get(id)
+      const kEntry = keywordByKey.get(id)
+      return {
+        chunk: (sEntry || kEntry).chunk,
+        rrf,
+        similarity: sEntry ? sEntry.similarity : 0,
+        keywordScore: kEntry ? kEntry.keywordScore : 0,
+      }
+    })
+    .sort((a, b) => b.rrf - a.rrf)
+
+  // Second-pass reranking (unchanged idea from the first RAG-quality
+  // pass, now fed the hybrid-merged shortlist instead of a cosine-only
+  // one): hand the top candidates to the backend's rerank_chunks() (an
+  // LLM read of the real question against each candidate) for a final
+  // precision pass. Falls back to the RRF-merged order if the rerank
+  // call fails for any reason, rather than losing the suggestion over it.
+  const candidatePool = merged.slice(0, KB_RERANK_POOL_SIZE)
   let rerankedIndices = []
   try {
     const res = await fetch(`${apiBase}/api/rerank-chunks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        question,
+        question: displayQuestion,
         candidates: candidatePool.map((s) => s.chunk.chunk_text),
         top_n: MAX_TRACK_KNOWLEDGE_MATCHES,
       }),
@@ -143,14 +243,14 @@ export async function matchTrackKnowledgeSemantic(apiBase, question, chunks) {
       if (Array.isArray(rerankJson.indices)) rerankedIndices = rerankJson.indices
     }
   } catch {
-    // Network hiccup -- candidatePool (cosine order) below covers it.
+    // Network hiccup -- candidatePool (RRF order) below covers it.
   }
 
   const selected =
     rerankedIndices.length > 0
       ? rerankedIndices.map((i) => candidatePool[i]).filter(Boolean)
       : candidatePool.slice(0, MAX_TRACK_KNOWLEDGE_MATCHES)
-  return selected.map((s) => ({ ...s.chunk, _similarity: s.similarity }))
+  return selected.map((s) => ({ ...s.chunk, _similarity: s.similarity, _keywordScore: s.keywordScore }))
 }
 
 // The backend streams plain text in a fixed two-section format (see

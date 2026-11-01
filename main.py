@@ -292,6 +292,14 @@ class LiveSuggestionRequest(BaseModel):
     profile_summary: str = ""  # general bio from the Profile screen, same text Mock Interview uses
     track_notes: str = ""  # free-text, company/role-specific notes from this Track (see Tracks screen)
     knowledge_context: str = ""  # top-matching chunks from this Track's knowledge base (see track_knowledge_chunks), already picked by the frontend via semantic search -- NOT the whole knowledge base
+    # Prior turns of THIS conversation -- [{role: 'user'|'assistant', content: str}, ...],
+    # oldest first. Only the Chatbot widget sends this (2 Nov RAG-quality
+    # pass #2, after Devanshu reported it "doesn't remember the previous
+    # interaction") -- Live Copilot leaves this empty since each
+    # interviewer question is still sent as its own suggestion request.
+    # Lets a follow-up like "and if I missed the deadline?" actually be
+    # answered as a follow-up instead of a context-free fresh question.
+    conversation_history: list[dict] = []
 
 
 @app.post("/api/live-suggestion")
@@ -322,6 +330,7 @@ def api_live_suggestion(payload: LiveSuggestionRequest):
                 "track_notes": payload.track_notes,
                 "knowledge_context": payload.knowledge_context,
             },
+            conversation_history=payload.conversation_history,
         ),
         media_type="text/plain",
     )
