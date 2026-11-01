@@ -375,25 +375,33 @@ def stream_live_suggestion_chunks(question: str, context: dict):
     reads it chunk by chunk and forwards each piece to the browser
     immediately, rather than waiting for the whole thing.
     """
+    # Each section gets an explicit, labeled header (### NAME ###)
+    # rather than a loose sentence -- Devanshu reported (1 Nov) that a
+    # lot of this context wasn't visibly influencing the responses.
+    # Loosely-worded inline context is easy for a model to skim past;
+    # clearly delimited sections plus an explicit instruction in the
+    # system prompt to use ALL of them is a much stronger signal.
     context_lines = []
     role = context.get("role_title") or ""
     company = context.get("company_name") or ""
     if role or company:
-        context_lines.append(f"Role: {role}" + (f" at {company}" if company else ""))
+        context_lines.append("### ROLE ###\n" + f"Role: {role}" + (f" at {company}" if company else ""))
     if context.get("jd_text"):
-        context_lines.append(f"Job description: {context['jd_text'][:1500]}")
+        context_lines.append("### JOB DESCRIPTION ###\n" + context["jd_text"][:3000])
     if context.get("resume_text"):
-        context_lines.append(f"Candidate resume: {context['resume_text'][:1500]}")
+        context_lines.append("### CANDIDATE RESUME ###\n" + context["resume_text"][:3000])
     if context.get("profile_summary"):
         # General bio from the Profile screen -- not tied to any one
         # company/role, same text Mock Interview's system instruction
         # already uses.
-        context_lines.append(f"About the candidate generally: {context['profile_summary'][:1000]}")
+        context_lines.append("### ABOUT THE CANDIDATE (general) ###\n" + context["profile_summary"][:2000])
     if context.get("track_notes"):
         # Free-text notes the candidate wrote specifically for THIS
         # Track (company/role) -- things that don't belong in the
         # general Profile summary or the JD itself.
-        context_lines.append(f"Candidate's own notes for this specific company/role: {context['track_notes'][:1000]}")
+        context_lines.append(
+            "### CANDIDATE'S OWN NOTES FOR THIS SPECIFIC COMPANY/ROLE ###\n" + context["track_notes"][:2000]
+        )
     if context.get("knowledge_context"):
         # The frontend already ran semantic search over this Track's
         # (possibly very large, 100k+ character) knowledge base and
@@ -402,37 +410,46 @@ def stream_live_suggestion_chunks(question: str, context: dict):
         # is already a short, targeted excerpt, not the whole thing,
         # so the cap here is just a safety net, not expected to bite.
         context_lines.append(
-            "Relevant background/reference material for this specific company/role "
-            "(ground the suggested answer in these real facts/specifics where relevant):\n"
-            + context["knowledge_context"][:6000]
+            "### RELEVANT BACKGROUND/REFERENCE MATERIAL FOR THIS COMPANY/ROLE ###\n"
+            + context["knowledge_context"][:8000]
         )
     if context.get("qa_context"):
-        # Pre-matched (on the frontend, by keyword overlap against
+        # Pre-matched (on the frontend, by semantic search against
         # this specific question) entries from the candidate's own
         # Q&A bank -- personal facts/stock answers like "who was your
-        # last client" that don't belong on any one Track. Given
-        # highest priority in the prompt since it's the candidate's
-        # own stated ground truth, not something to improvise around.
+        # last client" that don't belong on any one Track.
         context_lines.append(
-            "The candidate has pre-written answers to some of their own common "
-            "interview questions -- if any of these match what was just asked, "
-            "use them as the ground truth for the suggested answer:\n"
-            + context["qa_context"][:2000]
+            "### CANDIDATE'S OWN PRE-WRITTEN ANSWERS (use verbatim/near-verbatim if one matches) ###\n"
+            + context["qa_context"][:3000]
         )
-    context_block = "\n".join(context_lines)
+    context_block = "\n\n".join(context_lines)
 
     system_prompt = (
         "You are silently coaching a candidate DURING a real, live job interview. "
-        "The interviewer just asked something and the candidate needs help RIGHT "
-        "NOW -- be extremely concise, concrete, and grounded in their actual "
-        "background. Respond in EXACTLY this plain-text format, nothing else, no "
-        "markdown, no extra commentary before or after it:\n"
+        "The interviewer just asked something and the candidate needs help RIGHT NOW.\n\n"
+        "You will be given several labeled background sections (job description, resume, "
+        "candidate notes, reference material, pre-written answers) followed by the "
+        "interviewer's actual question. CRITICAL RULES:\n"
+        "1. Read EVERY section given to you before answering. If ANY section contains "
+        "information relevant to the question -- a specific fact, number, project name, "
+        "company detail, or a pre-written answer -- you MUST use that specific information "
+        "in your quick points and suggested answer. Do not give a generic, textbook-style "
+        "answer when a specific, grounded one is possible from what you were given.\n"
+        "2. If the 'CANDIDATE'S OWN PRE-WRITTEN ANSWERS' section has an entry that matches "
+        "the question, that entry IS the ground truth -- use it directly, don't improvise "
+        "around it.\n"
+        "3. Only fall back to a general answer if none of the given sections say anything "
+        "relevant to this specific question.\n"
+        "4. Be extremely concise and concrete.\n\n"
+        "Respond in EXACTLY this plain-text format, nothing else, no markdown, no extra "
+        "commentary before or after it:\n"
         "QUICK POINTS:\n"
         "- <short point, under 10 words>\n"
         "- <short point, under 10 words>\n"
         "- <short point, under 10 words>\n"
         "SUGGESTED ANSWER:\n"
-        "<one short, natural, ready-to-say answer, 2-4 sentences>"
+        "<one short, natural, ready-to-say answer, 2-4 sentences, using specifics from the "
+        "sections above wherever they're relevant>"
     )
     user_prompt = (
         (context_block + "\n\n" if context_block else "")
