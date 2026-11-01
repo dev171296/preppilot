@@ -403,15 +403,18 @@ def stream_live_suggestion_chunks(question: str, context: dict):
             "### CANDIDATE'S OWN NOTES FOR THIS SPECIFIC COMPANY/ROLE ###\n" + context["track_notes"][:2000]
         )
     if context.get("knowledge_context"):
-        # The frontend already ran semantic search over this Track's
-        # (possibly very large, 100k+ character) knowledge base and
-        # picked only the few chunks most relevant to THIS question
-        # (see matchTrackKnowledgeSemantic in LiveCopilot.jsx) -- this
-        # is already a short, targeted excerpt, not the whole thing,
-        # so the cap here is just a safety net, not expected to bite.
+        # The frontend already ran a two-stage retrieval over this
+        # Track's (possibly very large, 100k+ character) knowledge base
+        # -- cosine similarity shortlist, then an LLM rerank pass -- and
+        # picked the chunks most relevant to THIS question (see
+        # matchTrackKnowledgeSemantic in contextMatching.js). Raised
+        # 8000->16000 (2 Nov RAG-quality pass) since MAX_TRACK_KNOWLEDGE_
+        # MATCHES there went 4->8 -- this is still just a safety net
+        # (already-curated, targeted content), not expected to bite
+        # under normal use.
         context_lines.append(
             "### RELEVANT BACKGROUND/REFERENCE MATERIAL FOR THIS COMPANY/ROLE ###\n"
-            + context["knowledge_context"][:8000]
+            + context["knowledge_context"][:16000]
         )
     if context.get("qa_context"):
         # Pre-matched (on the frontend, by semantic search against
@@ -478,6 +481,75 @@ def stream_live_suggestion_chunks(question: str, context: dict):
                 yield piece
     except Exception as e:
         yield f"\n[LIVE_SUGGESTION_ERROR: {type(e).__name__}: {e}]"
+
+
+# How many cosine-shortlisted candidates we'll ever send to the
+# reranker in one call -- keeps the rerank prompt small (and therefore
+# fast/cheap) even if a Track's knowledge base has many chunks that
+# all scored reasonably on cosine similarity alone.
+RERANK_CANDIDATE_LIMIT = 12
+
+
+def rerank_chunks(question: str, candidates: list[str], top_n: int) -> list[int]:
+    """
+    Second-pass relevance ranking over an already cosine-shortlisted set
+    of Track knowledge-base candidate chunks (2 Nov RAG-quality pass --
+    see matchTrackKnowledgeSemantic's two-stage retrieval in
+    contextMatching.js). Cosine similarity over embeddings is fast but
+    fairly blunt -- it's good at "topically related," not always as good
+    at "actually answers THIS specific question" when there are many
+    plausible-looking candidates. This asks the same fast Groq model
+    already used for live suggestions to read the real question plus
+    each candidate passage and pick out just the ones that genuinely
+    help answer it, in order -- a cheap way to improve precision without
+    standing up a dedicated reranker model or service.
+
+    Returns the chosen indices (0-based, into `candidates`), best match
+    first. On ANY failure (API error, unexpected response shape, etc.)
+    returns [] rather than raising -- the caller is expected to fall
+    back to plain cosine-similarity order in that case, so a rerank
+    hiccup degrades quality slightly instead of breaking suggestions.
+    """
+    if not candidates:
+        return []
+    candidates = candidates[:RERANK_CANDIDATE_LIMIT]
+    listing = "\n\n".join(f"[{i}] {c[:600]}" for i, c in enumerate(candidates))
+    system_prompt = (
+        "You rank candidate text passages by how directly useful each one is for "
+        "answering a specific question. Reply with ONLY a JSON array of up to "
+        f"{top_n} integers -- the indices of the most genuinely relevant passages, "
+        "BEST FIRST. No other text, no markdown, no explanation. Example: [2, 0, 5]. "
+        "If none of the passages are meaningfully relevant to the question, reply "
+        "with exactly []."
+    )
+    user_prompt = f"Question: {question}\n\nPassages:\n{listing}"
+    try:
+        client = OpenAI(
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://api.groq.com/openai/v1",
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        resp = client.chat.completions.create(
+            model=SCORING_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        indices = json.loads(raw)
+        if not isinstance(indices, list):
+            return []
+        valid = [i for i in indices if isinstance(i, int) and 0 <= i < len(candidates)]
+        return valid[:top_n]
+    except Exception:
+        return []
 
 
 def embed_text(text: str, input_type: str = "query") -> list[float]:

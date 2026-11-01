@@ -29,6 +29,7 @@ from providers import (
     score_interview_session_summary,
     stream_live_suggestion_chunks,
     embed_text,
+    rerank_chunks,
 )
 
 app = FastAPI(title="PrepPilot API")
@@ -351,6 +352,33 @@ def api_embed_text(payload: EmbedTextRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
     return {"embedding": embedding}
+
+
+class RerankRequest(BaseModel):
+    question: str
+    candidates: list[str]
+    top_n: int = 6
+
+
+@app.post("/api/rerank-chunks")
+def api_rerank_chunks(payload: RerankRequest):
+    """
+    RAG-quality pass (2 Nov 2026): second-pass relevance reranking over
+    a set of Track-knowledge-base candidates the frontend already
+    cosine-similarity-shortlisted (see matchTrackKnowledgeSemantic in
+    contextMatching.js, and rerank_chunks() in providers.py for why
+    this exists). Returns which of the SENT candidates are genuinely
+    relevant, best first, as indices into payload.candidates -- the
+    frontend picks those chunks instead of (or in addition to) plain
+    cosine order. An empty `indices` list is a normal, expected outcome
+    (rerank failed, or genuinely nothing was relevant) and the caller
+    is expected to fall back to cosine order in that case, not treat it
+    as an error.
+    """
+    if not payload.question.strip() or not payload.candidates:
+        return {"indices": []}
+    indices = rerank_chunks(payload.question, payload.candidates, payload.top_n)
+    return {"indices": indices}
 
 
 @app.get("/status", response_class=HTMLResponse)

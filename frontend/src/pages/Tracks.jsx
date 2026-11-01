@@ -12,12 +12,21 @@ const ALLOWED_RESUME_TYPES = {
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
 }
 
-// Target size for one knowledge-base chunk, in words. Big enough to
-// hold a full Q&A pair or a self-contained paragraph of context,
-// small enough that Live Copilot's top-4 matches (see LiveCopilot.jsx's
-// MAX_TRACK_KNOWLEDGE_MATCHES) stay a reasonable size to send on every
-// live suggestion request.
-const KNOWLEDGE_CHUNK_TARGET_WORDS = 300
+// Target size for one knowledge-base chunk, in words -- and how many
+// words of OVERLAP to carry from one chunk into the next (2 Nov
+// RAG-quality pass: lowered from 300 with no overlap at all, to 180
+// with ~30-word overlap). Smaller chunks mean retrieval can be more
+// precise about WHICH part of a large pasted block is actually
+// relevant to a given question; the overlap means an idea that gets
+// cut right at a chunk boundary still has its immediate lead-in
+// visible even if only the chunk AFTER the cut gets retrieved on its
+// own. NOTE: this only affects knowledge bases indexed/re-indexed
+// AFTER this change -- a Track's EXISTING chunks in the DB were split
+// with the old settings and need Devanshu to re-paste the text and
+// click "Index" again to pick up the new chunking (the raw pasted
+// text itself is never stored, only the derived chunks).
+const KNOWLEDGE_CHUNK_TARGET_WORDS = 180
+const KNOWLEDGE_CHUNK_OVERLAP_WORDS = 30
 
 // Splits a large pasted block of text (could be 100k+ characters) into
 // chunks small enough to embed and retrieve individually -- the same
@@ -25,7 +34,9 @@ const KNOWLEDGE_CHUNK_TARGET_WORDS = 300
 // to freeform text instead of discrete Q&A pairs. Splits on blank
 // lines first (so it doesn't cut a paragraph or a "Q: ... A: ..." pair
 // in half where avoidable), then groups consecutive paragraphs together
-// until the target word count is reached.
+// until the target word count is reached. A final pass then prepends
+// the tail of each chunk to the NEXT one (see KNOWLEDGE_CHUNK_OVERLAP_WORDS
+// above).
 function chunkKnowledgeText(text) {
   const paragraphs = text
     .split(/\n\s*\n/)
@@ -65,7 +76,17 @@ function chunkKnowledgeText(text) {
     currentWords += paraWords.length
   }
   flush()
-  return chunks
+
+  // Overlap pass: give every chunk after the first a short lead-in
+  // from the end of the PREVIOUS chunk, separated by an ellipsis so
+  // it's visibly not part of this chunk's own text. Chunk 0 has no
+  // predecessor, so it's left untouched.
+  return chunks.map((chunk, i) => {
+    if (i === 0) return chunk
+    const prevWords = chunks[i - 1].split(/\s+/).filter(Boolean)
+    const overlap = prevWords.slice(-KNOWLEDGE_CHUNK_OVERLAP_WORDS).join(' ')
+    return overlap ? `${overlap} ... ${chunk}` : chunk
+  })
 }
 
 /**

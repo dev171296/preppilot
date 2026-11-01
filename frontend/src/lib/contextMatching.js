@@ -10,11 +10,31 @@
 export const QUICK_POINTS_MARKER = 'QUICK POINTS:'
 export const SUGGESTED_ANSWER_MARKER = 'SUGGESTED ANSWER:'
 export const MAX_QA_MATCHES = 3
-// How many of this Track's knowledge-base chunks (see Tracks.jsx's
-// "Knowledge base" section) to pull in per question -- kept small
-// since these get sent on every live suggestion request, same
-// reasoning as MAX_QA_MATCHES above.
-export const MAX_TRACK_KNOWLEDGE_MATCHES = 4
+// How many of this Track's knowledge-base chunks to actually send
+// with a question. Raised from 4 (2 Nov RAG-quality pass) --
+// Devanshu's knowledge bases can run 100k+ characters / 50+ chunks,
+// and 4 was too few to reliably cover a broad question even with
+// good retrieval. The 128k-token model context has plenty of room
+// for more.
+export const MAX_TRACK_KNOWLEDGE_MATCHES = 8
+// Cosine similarity floor (2 Nov) -- below this, a chunk/entry is
+// treated as "not actually relevant" and left out rather than
+// force-included just because it was the least-bad of what's
+// available. Deliberately LOW (not a strict cutoff) because a
+// real relevant match should always comfortably clear it, and the
+// cost of filtering out something genuinely useful is worse than
+// occasionally letting through something marginal. Treat this as a
+// starting point, not a final answer -- the Chatbot widget's
+// "Context used" panel shows the actual similarity scores on real
+// questions, which is the right way to tune this number with real
+// data instead of guessing further.
+export const MIN_SIMILARITY = 0.15
+// How many cosine-shortlisted candidates to hand to the backend's
+// second-pass reranker (see matchTrackKnowledgeSemantic below) --
+// kept well above MAX_TRACK_KNOWLEDGE_MATCHES so the reranker has
+// real choices to make, but capped so the rerank call itself (one
+// extra LLM round-trip) stays small and fast.
+export const KB_RERANK_POOL_SIZE = 12
 
 // Real semantic search (30 Sep upgrade, replacing keyword-overlap
 // matching). Cosine similarity is the standard way to compare two
@@ -62,8 +82,13 @@ export async function matchQaEntriesSemantic(apiBase, question, qaEntries) {
   }
   const scored = withEmbeddings
     .map((e) => ({ entry: e, similarity: cosineSimilarity(questionEmbedding, e.embedding) }))
+    .filter((s) => s.similarity >= MIN_SIMILARITY)
     .sort((a, b) => b.similarity - a.similarity)
-  return scored.slice(0, MAX_QA_MATCHES).map((s) => s.entry)
+  // _similarity is attached (not just used to sort/filter) so callers --
+  // right now just the Chatbot widget's "Context used" panel -- can show
+  // real relevance scores instead of a black box. Harmless extra field
+  // for existing callers that just read .question/.answer off these.
+  return scored.slice(0, MAX_QA_MATCHES).map((s) => ({ ...s.entry, _similarity: s.similarity }))
 }
 
 // Same idea as matchQaEntriesSemantic above, but over this Track's
@@ -89,8 +114,43 @@ export async function matchTrackKnowledgeSemantic(apiBase, question, chunks) {
   }
   const scored = withEmbeddings
     .map((c) => ({ chunk: c, similarity: cosineSimilarity(questionEmbedding, c.embedding) }))
+    .filter((s) => s.similarity >= MIN_SIMILARITY)
     .sort((a, b) => b.similarity - a.similarity)
-  return scored.slice(0, MAX_TRACK_KNOWLEDGE_MATCHES).map((s) => s.chunk)
+  if (scored.length === 0) return []
+
+  // Stage 1 (above) is cosine similarity over embeddings -- fast, but
+  // not always great at telling "topically related" apart from
+  // "actually answers this question" once there are several
+  // plausible candidates. Stage 2: hand the top candidate pool to the
+  // backend's rerank_chunks() (an LLM read of the real question
+  // against each candidate) to pick the genuinely best ones. If the
+  // rerank call fails or returns nothing usable, fall back to plain
+  // cosine order rather than losing the suggestion entirely over it.
+  const candidatePool = scored.slice(0, KB_RERANK_POOL_SIZE)
+  let rerankedIndices = []
+  try {
+    const res = await fetch(`${apiBase}/api/rerank-chunks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question,
+        candidates: candidatePool.map((s) => s.chunk.chunk_text),
+        top_n: MAX_TRACK_KNOWLEDGE_MATCHES,
+      }),
+    })
+    if (res.ok) {
+      const rerankJson = await res.json()
+      if (Array.isArray(rerankJson.indices)) rerankedIndices = rerankJson.indices
+    }
+  } catch {
+    // Network hiccup -- candidatePool (cosine order) below covers it.
+  }
+
+  const selected =
+    rerankedIndices.length > 0
+      ? rerankedIndices.map((i) => candidatePool[i]).filter(Boolean)
+      : candidatePool.slice(0, MAX_TRACK_KNOWLEDGE_MATCHES)
+  return selected.map((s) => ({ ...s.chunk, _similarity: s.similarity }))
 }
 
 // The backend streams plain text in a fixed two-section format (see

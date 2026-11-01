@@ -111,6 +111,18 @@ function ChatbotWidget() {
       const qaContext = matchedQa.map((e) => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
       const matchedKnowledge = await matchTrackKnowledgeSemantic(API_BASE, question, trackKnowledgeChunks)
       const knowledgeContext = matchedKnowledge.map((c) => c.chunk_text).join('\n\n')
+
+      // Show exactly what retrieval picked for this question -- the
+      // whole point of this widget (2 Nov RAG-quality pass) is to make
+      // "is my context actually being used, and is it the RIGHT
+      // context" something you can actually see, not just guess at.
+      // Shown before the answer even starts streaming, since this is
+      // already known at this point.
+      if (mountedRef.current) {
+        setMessages((prev) =>
+          prev.map((m) => (m.id === assistantMsgId ? { ...m, contextUsed: { qa: matchedQa, knowledge: matchedKnowledge } } : m))
+        )
+      }
       const res = await fetch(`${API_BASE}/api/live-suggestion`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -215,6 +227,28 @@ function ChatbotWidget() {
                   {m.suggestedAnswer && <p className="chatbot-suggested-answer">{m.suggestedAnswer}</p>}
                   {m.streaming && !m.suggestedAnswer && (!m.quickPointers || m.quickPointers.length === 0) && (
                     <p className="chatbot-hint">Thinking...</p>
+                  )}
+                  {m.contextUsed && (m.contextUsed.qa.length > 0 || m.contextUsed.knowledge.length > 0) && (
+                    <details className="chatbot-context-used">
+                      <summary>
+                        Context used ({m.contextUsed.qa.length} Q&amp;A, {m.contextUsed.knowledge.length} knowledge-base)
+                      </summary>
+                      {m.contextUsed.knowledge.map((c, i) => (
+                        <div key={`k${i}`} className="chatbot-context-item">
+                          <span className="chatbot-context-score">KB · similarity {c._similarity.toFixed(2)}</span>
+                          <p>{c.chunk_text.slice(0, 220)}{c.chunk_text.length > 220 ? '…' : ''}</p>
+                        </div>
+                      ))}
+                      {m.contextUsed.qa.map((e, i) => (
+                        <div key={`q${i}`} className="chatbot-context-item">
+                          <span className="chatbot-context-score">Saved Q&amp;A · similarity {e._similarity.toFixed(2)}</span>
+                          <p>{e.question}</p>
+                        </div>
+                      ))}
+                    </details>
+                  )}
+                  {m.contextUsed && m.contextUsed.qa.length === 0 && m.contextUsed.knowledge.length === 0 && !m.streaming && (
+                    <p className="chatbot-hint">No saved Q&amp;A or knowledge-base match cleared the relevance threshold for this question.</p>
                   )}
                 </div>
               )

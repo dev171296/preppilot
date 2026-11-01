@@ -422,3 +422,34 @@ button:disabled {
   background: #334155;
   cursor: not-allowed;
 }
+
+.chatbot-context-used {
+  margin-top: 0.4rem;
+  font-size: 0.78rem;
+  color: #94a3b8;
+}
+
+.chatbot-context-used summary {
+  cursor: pointer;
+  color: #93c5fd;
+}
+
+.chatbot-context-item {
+  margin-top: 0.35rem;
+  padding: 0.35rem 0.5rem;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 6px;
+}
+
+.chatbot-context-score {
+  display: block;
+  font-size: 0.7rem;
+  color: #60a5fa;
+  margin-bottom: 0.15rem;
+}
+
+.chatbot-context-item p {
+  margin: 0;
+  color: #cbd5e1;
+}
