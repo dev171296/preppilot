@@ -59,6 +59,31 @@ const MAX_BUFFERED_AUDIO_SECONDS = 120
 // Chatbot test widget (ChatbotWidget.jsx) can reuse the exact same
 // retrieval code Live Copilot uses, instead of a second copy of it.
 
+// How many of this session's own prior exchanges to send to the backend
+// as real chat turns, same idea and same limit as ChatbotWidget.jsx's
+// CONVERSATION_HISTORY_LIMIT -- enough for a natural follow-up ("and the
+// second one?") without letting the prompt grow unbounded over a long
+// interview. Added so Live Copilot has conversation memory too (it did
+// not before), with NO extra network round-trip: conversation_history is
+// just additional JSON in the same POST already sent to /api/live-suggestion.
+const CONVERSATION_HISTORY_LIMIT = 6
+
+// Turns the suggestions already collected this session into the
+// {role, content} shape the backend expects, oldest first, capped to
+// the last N. Only completed (non-streaming) suggestions are included
+// -- a still-streaming one would send a half-finished answer as if it
+// were final, and the one currently being requested isn't in this list
+// yet anyway (it's added to `suggestions` after this read happens).
+function buildConversationHistory(priorSuggestions) {
+  const history = []
+  for (const s of priorSuggestions) {
+    if (s.streaming) continue
+    if (s.question) history.push({ role: 'user', content: s.question })
+    if (s.suggestedAnswer) history.push({ role: 'assistant', content: s.suggestedAnswer })
+  }
+  return history.slice(-CONVERSATION_HISTORY_LIMIT)
+}
+
 // Holds one raw PCM16 audio chunk that couldn't be sent because the
 // connection to the backend was down at the time -- see
 // processor.onaudioprocess below, which calls this instead of
@@ -130,14 +155,19 @@ function LiveCopilot() {
   // speaker change/UtteranceEnd to flush the whole turn to `turns`
   // below -- so the transcript appears live instead of all at once.
   const [liveLine, setLiveLine] = useState(null) // {speaker, text}
-  // Older suggestions collapse by default so the latest 2 always fit
-  // on screen together -- this expands the full history on demand.
-  const [showEarlierSuggestions, setShowEarlierSuggestions] = useState(false)
-
   const liveRef = useRef(null)
   const mountedRef = useRef(true)
   const suggestionIdRef = useRef(0)
   const turnIdRef = useRef(0)
+  // Always-current mirror of `suggestions`, read by requestSuggestion
+  // when building conversation_history below -- requestSuggestion can
+  // be invoked from a websocket callback bound on an earlier render,
+  // so reading the `suggestions` state variable directly there could
+  // see a stale list; the ref is kept in sync on every render instead.
+  const suggestionsRef = useRef([])
+  // Auto-scrolls the merged conversation feed to the latest line/card,
+  // the same pattern used in ChatbotWidget.jsx.
+  const feedScrollRef = useRef(null)
 
   useEffect(() => {
     mountedRef.current = true
@@ -145,6 +175,16 @@ function LiveCopilot() {
       mountedRef.current = false
     }
   }, [])
+
+  useEffect(() => {
+    suggestionsRef.current = suggestions
+  }, [suggestions])
+
+  useEffect(() => {
+    if (feedScrollRef.current) {
+      feedScrollRef.current.scrollTop = feedScrollRef.current.scrollHeight
+    }
+  }, [turns, suggestions, liveLine])
 
   useEffect(() => {
     if (!session) return
@@ -304,6 +344,10 @@ function LiveCopilot() {
       ])
       const qaContext = matchedQa.map((e) => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
       const knowledgeContext = matchedKnowledge.map((c) => c.chunk_text).join('\n\n')
+      // Read from the ref, not the `suggestions` state variable --
+      // see suggestionsRef's comment above. No extra round-trip: this
+      // just adds a field to the POST body already being sent below.
+      const conversationHistory = buildConversationHistory(suggestionsRef.current)
       const res = await fetch(`${API_BASE}/api/live-suggestion`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -317,6 +361,7 @@ function LiveCopilot() {
           profile_summary: profile?.summary || '',
           track_notes: selectedTrack?.notes || '',
           knowledge_context: knowledgeContext,
+          conversation_history: conversationHistory,
         }),
       })
       const reader = res.body.getReader()
@@ -463,7 +508,6 @@ function LiveCopilot() {
     setError(null)
     setTurns([])
     setSuggestions([])
-    setShowEarlierSuggestions(false)
     setPaused(false)
     setConnectionState('connected')
     setReconnectAttempt(0)
@@ -842,13 +886,28 @@ function LiveCopilot() {
     setError(null)
     setTurns([])
     setSuggestions([])
-    setShowEarlierSuggestions(false)
     setPaused(false)
     setConnectionState('connected')
     setReconnectAttempt(0)
   }
 
-  const orderedSuggestions = suggestions.slice().reverse()
+  // One chronological, conversation-style feed instead of two separate
+  // "Suggestions" / "Transcript" blocks -- each transcript line is
+  // followed immediately by the suggestion it triggered (matched by
+  // localTurnId, the same client-side id used elsewhere to link the
+  // two), so the whole interview reads top-to-bottom like a chat
+  // thread rather than "latest suggestion" + "full transcript" kept
+  // separately.
+  const feedItems = []
+  for (const turn of turns) {
+    feedItems.push({ kind: 'turn', key: `turn-${turn.localTurnId}`, turn })
+    if (turn.speaker === 'interviewer') {
+      const suggestion = suggestions.find((s) => s.localTurnId === turn.localTurnId)
+      if (suggestion) {
+        feedItems.push({ kind: 'suggestion', key: `suggestion-${suggestion.id}`, suggestion })
+      }
+    }
+  }
 
   return (
     <section>
@@ -918,65 +977,42 @@ function LiveCopilot() {
 
       {error && <p className="form-error">{error}</p>}
 
-      {(status === 'live' || status === 'ended') && orderedSuggestions.length > 0 && (
-        <div>
-          <strong>Suggestions (newest first):</strong>
-          {/* Always show the latest 2 in full (compact styling, see
-              App.css) so both fit on screen together without scrolling
-              -- older ones collapse to a one-line summary behind a
-              toggle, since mid-interview you mainly need THIS and the
-              PREVIOUS question, not the full history at once. */}
-          {orderedSuggestions.map((s, i) => {
-            const questionNumber = orderedSuggestions.length - i
-            const isLatest = i === 0
-            const isRecent = i < 2
-            if (!isRecent && !showEarlierSuggestions) {
-              return null
-            }
-            if (!isRecent) {
-              return (
-                <div key={s.id} className="suggestion-card suggestion-card-collapsed">
-                  <div className="suggestion-label">Question {questionNumber}</div>
-                  <p className="suggestion-question">{s.question}</p>
-                </div>
-              )
-            }
-            return (
-              <div key={s.id} className={isLatest ? 'suggestion-card is-latest' : 'suggestion-card'}>
-                <div className="suggestion-label">
-                  {isLatest ? 'LATEST — ' : ''}Question {questionNumber}
-                  {s.streaming ? ' · typing…' : ''}
-                </div>
-                <p className="suggestion-question">{s.question}</p>
-                {s.quickPointers.length > 0 && (
-                  <ul>
-                    {s.quickPointers.map((p, pi) => (
-                      <li key={pi}>{p}</li>
-                    ))}
-                  </ul>
+      {(status === 'live' || status === 'ended') && (feedItems.length > 0 || liveLine) && (
+        <div className="conversation-feed" ref={feedScrollRef}>
+          {feedItems.map((item) =>
+            item.kind === 'turn' ? (
+              <p key={item.key} className={`feed-turn feed-turn-${item.turn.speaker}`}>
+                <strong>{item.turn.speaker === 'you' ? 'You' : 'Interviewer'}:</strong> {item.turn.text}
+              </p>
+            ) : (
+              <div
+                key={item.key}
+                className={item.suggestion.streaming ? 'suggestion-card is-latest' : 'suggestion-card'}
+              >
+                {item.suggestion.streaming && <div className="suggestion-label">typing…</div>}
+                {item.suggestion.quickPointers.length > 0 && (
+                  <table className="suggestion-points-table">
+                    <tbody>
+                      {item.suggestion.quickPointers.map((p, pi) => (
+                        <tr key={pi}>
+                          <td className="suggestion-point-cell">{p.point}</td>
+                          <td className="suggestion-explanation-cell">{p.explanation}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 )}
-                {s.suggestedAnswer && <p className="suggestion-answer">{s.suggestedAnswer}</p>}
+                {item.suggestion.suggestedAnswer && (
+                  <p className="suggestion-answer">{item.suggestion.suggestedAnswer}</p>
+                )}
               </div>
             )
-          })}
-          {orderedSuggestions.length > 2 && (
-            <button type="button" className="link-button" onClick={() => setShowEarlierSuggestions((v) => !v)}>
-              {showEarlierSuggestions ? 'Hide earlier questions' : `Show ${orderedSuggestions.length - 2} earlier question${orderedSuggestions.length - 2 === 1 ? '' : 's'}`}
-            </button>
           )}
-        </div>
-      )}
-
-      {(status === 'live' || status === 'ended') && (turns.length > 0 || liveLine) && (
-        <div className="transcript">
-          <strong>Transcript:</strong>
-          {turns.map((turn, i) => (
-            <p key={i}>
-              <strong>{turn.speaker === 'you' ? 'You' : 'Interviewer'}:</strong> {turn.text}
-            </p>
-          ))}
           {liveLine && (
-            <p style={{ opacity: liveLine.interim ? 0.55 : 0.8, fontStyle: liveLine.interim ? 'italic' : 'normal' }}>
+            <p
+              className={`feed-turn feed-turn-${liveLine.speaker}`}
+              style={{ opacity: liveLine.interim ? 0.55 : 0.8, fontStyle: liveLine.interim ? 'italic' : 'normal' }}
+            >
               <strong>{liveLine.speaker === 'you' ? 'You' : 'Interviewer'}:</strong> {liveLine.text}
             </p>
           )}

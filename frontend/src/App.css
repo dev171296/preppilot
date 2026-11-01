@@ -221,20 +221,67 @@ button:disabled {
   font-size: 0.92rem;
 }
 
-.suggestion-card ul {
-  margin: 0 0 0.35rem 0;
-  padding-left: 1.1rem;
-}
-
-.suggestion-card li {
-  margin-bottom: 0.15rem;
-  font-size: 0.88rem;
-}
-
 .suggestion-card .suggestion-answer {
   font-size: 0.92rem;
   line-height: 1.35;
   margin: 0;
+}
+
+/* Merged conversation-style feed in Live Copilot (2 Nov) -- replaces
+   the old separate "Suggestions" + "Transcript" blocks with one
+   scrollable, auto-scrolling thread: transcript lines interleaved
+   with the suggestion card each interviewer question triggered. */
+.conversation-feed {
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-top: 1rem;
+  max-height: 60vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.feed-turn {
+  margin: 0.2rem 0;
+}
+
+.feed-turn-you {
+  color: #cbd5e1;
+}
+
+.feed-turn-interviewer {
+  color: #f8fafc;
+}
+
+/* Quick points as a small 2-column table (point | explanation)
+   instead of a bullet list -- used by both Live Copilot and the
+   Chatbot test widget, since they share the same streamed-suggestion
+   format (see parseStreamedSuggestion in contextMatching.js). */
+.suggestion-points-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 0.35rem 0;
+  font-size: 0.88rem;
+}
+
+.suggestion-points-table tr + tr {
+  border-top: 1px solid #1e293b;
+}
+
+.suggestion-point-cell {
+  font-weight: 600;
+  color: #60a5fa;
+  padding: 0.2rem 0.5rem 0.2rem 0;
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.suggestion-explanation-cell {
+  color: #e2e8f0;
+  padding: 0.2rem 0;
+  vertical-align: top;
 }
 
 .shortcut-grid {

@@ -284,5 +284,18 @@ export function parseStreamedSuggestion(fullText) {
     .split('\n')
     .map((line) => line.replace(/^[-•]\s*/, '').trim())
     .filter(Boolean)
+    .map((line) => {
+      // Expected format: "<point> :: <explanation>". While streaming, the
+      // separator for the current (last) line may not have arrived yet, so
+      // fall back to treating the whole line as the point with no explanation.
+      const sepIdx = line.indexOf('::')
+      if (sepIdx === -1) {
+        return { point: line, explanation: '' }
+      }
+      return {
+        point: line.slice(0, sepIdx).trim(),
+        explanation: line.slice(sepIdx + 2).trim(),
+      }
+    })
   return { quickPointers, suggestedAnswer: answerBlock }
 }

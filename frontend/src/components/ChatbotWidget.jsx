@@ -291,11 +291,16 @@ function ChatbotWidget() {
               ) : (
                 <div key={m.id} className="chatbot-message chatbot-message-assistant">
                   {m.quickPointers && m.quickPointers.length > 0 && (
-                    <ul>
-                      {m.quickPointers.map((p, i) => (
-                        <li key={i}>{p}</li>
-                      ))}
-                    </ul>
+                    <table className="suggestion-points-table">
+                      <tbody>
+                        {m.quickPointers.map((p, i) => (
+                          <tr key={i}>
+                            <td className="suggestion-point-cell">{p.point}</td>
+                            <td className="suggestion-explanation-cell">{p.explanation}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   )}
                   {m.suggestedAnswer && <p className="chatbot-suggested-answer">{m.suggestedAnswer}</p>}
                   {m.streaming && !m.suggestedAnswer && (!m.quickPointers || m.quickPointers.length === 0) && (
