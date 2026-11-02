@@ -22,6 +22,17 @@ const CALIBRATION_MS = 6000
 // show up; this only kicks in when it doesn't.
 const UTTERANCE_FALLBACK_MS = 3500
 
+// How long to hold a just-completed INTERVIEWER turn before actually
+// asking for a suggestion (2 Nov) -- a VAD-style grace window so a
+// quick breath/pause mid-question doesn't get treated as the end of
+// it. If another interviewer-attributed segment arrives inside this
+// window, it's appended to the held turn and the window restarts;
+// only once 1.5s passes with nothing further does the merged text
+// actually get sent for a suggestion. A same-speaker continuation
+// restarts the window every time, so a genuinely long multi-part
+// question still only fires once, after the LAST pause.
+const INTERVIEWER_MERGE_WINDOW_MS = 1500
+
 // Render's free hosting tier sleeps the backend after ~15 min idle.
 // A Live Copilot session can easily sit quietly for longer than that
 // while waiting for the interviewer to actually start talking (mic on,
@@ -165,6 +176,14 @@ function LiveCopilot() {
   // so reading the `suggestions` state variable directly there could
   // see a stale list; the ref is kept in sync on every render instead.
   const suggestionsRef = useRef([])
+  // The most recently completed INTERVIEWER turn, held back from
+  // triggering a suggestion for a short grace window (2 Nov, VAD-style
+  // merge, in response to "quick pauses breaking one sentence into
+  // multiple"). If another interviewer-attributed segment arrives
+  // before the window elapses, its text is appended to this one and
+  // the window restarts, instead of treating it as a second separate
+  // question. { localTurnId, dbTurnId, text, timer } | null.
+  const pendingMergeRef = useRef(null)
   // Auto-scrolls the merged conversation feed to the latest line/card,
   // the same pattern used in ChatbotWidget.jsx.
   const feedScrollRef = useRef(null)
@@ -253,17 +272,75 @@ function LiveCopilot() {
 
   // A completed utterance (already coalesced by speaker in
   // handleDeepgramMessage below) is added to the transcript and, for
-  // the candidate's own record, saved. Interviewer turns additionally
-  // trigger a suggestion request.
+  // the candidate's own record, saved.
+  //
+  // Interviewer turns don't trigger a suggestion immediately -- they
+  // go through pendingMergeRef's grace window first (see
+  // INTERVIEWER_MERGE_WINDOW_MS above), so a quick pause mid-question
+  // doesn't fire a suggestion on just the first half of it.
   async function appendCompletedTurn(speaker, text) {
-    // A client-side id, separate from the database row's id below --
-    // this is what lets fixLastTurnSpeaker() (further down) find and
-    // remove/retrigger the right suggestion when correcting a
-    // misattributed turn, without waiting on the DB insert.
+    if (speaker === 'interviewer') {
+      const pending = pendingMergeRef.current
+      if (pending) {
+        // Another interviewer segment arrived inside the grace window
+        // -- this is (most likely) a continuation of the same
+        // question after a brief pause, not a second question. Merge
+        // it into the held turn's text and restart the window,
+        // instead of creating a new transcript line / suggestion.
+        if (pending.timer) clearTimeout(pending.timer)
+        pending.text = `${pending.text} ${text}`.trim()
+        setTurns((prev) => prev.map((t) => (t.localTurnId === pending.localTurnId ? { ...t, text: pending.text } : t)))
+        if (pending.dbTurnId) {
+          supabase
+            .from('live_turns')
+            .update({ text: pending.text })
+            .eq('id', pending.dbTurnId)
+            .then(({ error: updateError }) => {
+              if (updateError) console.error('Failed to update merged turn:', updateError.message)
+            })
+        }
+        pending.timer = setTimeout(finalizePendingInterviewerTurn, INTERVIEWER_MERGE_WINDOW_MS)
+        return
+      }
+
+      // First segment of a (possibly multi-part) interviewer turn --
+      // add it to the transcript and save it right away, same as
+      // before, but hold off on requesting a suggestion for it.
+      const localTurnId = ++turnIdRef.current
+      setTurns((prev) => [...prev, { speaker, text, localTurnId, dbTurnId: null }])
+      const sid = liveRef.current?.sessionId
+      let dbTurnId = null
+      if (sid) {
+        const { data, error: insertError } = await supabase
+          .from('live_turns')
+          .insert({ session_id: sid, speaker, text })
+          .select('id')
+          .single()
+        if (insertError) console.error('Failed to save turn:', insertError.message)
+        else {
+          dbTurnId = data.id
+          setTurns((prev) => prev.map((t) => (t.localTurnId === localTurnId ? { ...t, dbTurnId } : t)))
+        }
+      }
+      pendingMergeRef.current = {
+        localTurnId,
+        dbTurnId,
+        text,
+        timer: setTimeout(finalizePendingInterviewerTurn, INTERVIEWER_MERGE_WINDOW_MS),
+      }
+      return
+    }
+
+    // speaker === 'you': a speaker change is a clear signal the
+    // interviewer is done for now, so finalize any still-pending
+    // interviewer turn right away instead of waiting out its window.
+    if (pendingMergeRef.current) {
+      finalizePendingInterviewerTurn()
+    }
+
     const localTurnId = ++turnIdRef.current
     setTurns((prev) => [...prev, { speaker, text, localTurnId, dbTurnId: null }])
     const sid = liveRef.current?.sessionId
-    let dbTurnId = null
     if (sid) {
       const { data, error: insertError } = await supabase
         .from('live_turns')
@@ -272,13 +349,22 @@ function LiveCopilot() {
         .single()
       if (insertError) console.error('Failed to save turn:', insertError.message)
       else {
-        dbTurnId = data.id
+        const dbTurnId = data.id
         setTurns((prev) => prev.map((t) => (t.localTurnId === localTurnId ? { ...t, dbTurnId } : t)))
       }
     }
-    if (speaker === 'interviewer') {
-      requestSuggestion(text, dbTurnId, localTurnId)
-    }
+  }
+
+  // Ends an interviewer turn's grace window early and actually
+  // requests a suggestion for its (possibly merged) text. Called when
+  // the window naturally elapses, when the candidate starts speaking
+  // (a speaker change), or when the session is ending.
+  function finalizePendingInterviewerTurn() {
+    const pending = pendingMergeRef.current
+    if (!pending) return
+    pendingMergeRef.current = null
+    if (pending.timer) clearTimeout(pending.timer)
+    requestSuggestion(pending.text, pending.dbTurnId, pending.localTurnId)
   }
 
   // Deepgram's live diarization has no confidence score to catch this
@@ -302,10 +388,22 @@ function LiveCopilot() {
     const flipped = last.speaker === 'you' ? 'interviewer' : 'you'
     setTurns((prev) => [...prev.slice(0, -1), { ...last, speaker: flipped }])
 
+    // If this turn is still sitting in its merge grace window (no
+    // suggestion requested for it yet), cancel that window -- it's
+    // being corrected by hand, so the automatic merge/finalize logic
+    // shouldn't also act on it.
+    if (pendingMergeRef.current && pendingMergeRef.current.localTurnId === last.localTurnId) {
+      if (pendingMergeRef.current.timer) clearTimeout(pendingMergeRef.current.timer)
+      pendingMergeRef.current = null
+    }
+
     if (last.speaker === 'interviewer' && flipped === 'you') {
       setSuggestions((prev) => prev.filter((s) => s.localTurnId !== last.localTurnId))
     }
     if (last.speaker === 'you' && flipped === 'interviewer') {
+      // A manual correction -- ask for a suggestion right away rather
+      // than starting a new grace window, since the person doing this
+      // already knows the full question.
       requestSuggestion(last.text, last.dbTurnId, last.localTurnId)
     }
     if (last.dbTurnId) {
@@ -319,9 +417,13 @@ function LiveCopilot() {
     }
   }
 
-  // Reads the streamed response chunk by chunk, updating this one
-  // suggestion entry's text as it grows -- this is what makes it
-  // appear "typed" live instead of arriving as one sudden paragraph.
+  // Reads the response over the same streamed connection as before
+  // (no backend change needed), but -- per Devanshu's request (2 Nov,
+  // "I dont want streaming... difficult to focus on") -- no longer
+  // updates the UI chunk by chunk as it arrives. The card just shows
+  // "typing..." the whole time and then the FULL quick points +
+  // answer appear at once, only after the response is completely
+  // generated.
   async function requestSuggestion(question, turnId, localTurnId) {
     const id = ++suggestionIdRef.current
     const placeholder = { id, question, quickPointers: [], suggestedAnswer: '', streaming: true, localTurnId }
@@ -370,10 +472,9 @@ function LiveCopilot() {
         const { done, value } = await reader.read()
         if (done) break
         fullText += decoder.decode(value, { stream: true })
-        const parsed = parseStreamedSuggestion(fullText)
-        if (mountedRef.current) {
-          setSuggestions((prev) => prev.map((s) => (s.id === id ? { ...s, ...parsed, streaming: true } : s)))
-        }
+        // Intentionally no setSuggestions() here -- fullText is only
+        // accumulated as chunks arrive; the card stays on "typing..."
+        // until the loop ends below, instead of updating live.
       }
     } catch (err) {
       console.error('Suggestion error:', err.message)
@@ -512,6 +613,8 @@ function LiveCopilot() {
     setConnectionState('connected')
     setReconnectAttempt(0)
     setStatus('preparing')
+    if (pendingMergeRef.current?.timer) clearTimeout(pendingMergeRef.current.timer)
+    pendingMergeRef.current = null
 
     let resumeText = ''
     let jdText = selectedTrack?.jd_text || ''
@@ -832,6 +935,12 @@ function LiveCopilot() {
     if (state.pauseKeepAliveTimer) clearInterval(state.pauseKeepAliveTimer)
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
     flushCurrentBuffer()
+    // The session is ending -- don't leave the last interviewer turn
+    // waiting out its merge window with nobody left to see the
+    // suggestion arrive; ask for it now instead of dropping it.
+    if (pendingMergeRef.current) {
+      finalizePendingInterviewerTurn()
+    }
     try {
       state.ws && state.ws.close()
     } catch (e) {
@@ -889,6 +998,8 @@ function LiveCopilot() {
     setPaused(false)
     setConnectionState('connected')
     setReconnectAttempt(0)
+    if (pendingMergeRef.current?.timer) clearTimeout(pendingMergeRef.current.timer)
+    pendingMergeRef.current = null
   }
 
   // One chronological, conversation-style feed instead of two separate
