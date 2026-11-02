@@ -278,6 +278,12 @@ button:disabled {
   vertical-align: top;
 }
 
+.suggestion-card .suggestion-error {
+  color: #fca5a5;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
 .suggestion-explanation-cell {
   color: #e2e8f0;
   padding: 0.2rem 0;

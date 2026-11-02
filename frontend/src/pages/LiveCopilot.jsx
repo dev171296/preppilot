@@ -2,10 +2,20 @@ import { useEffect, useRef, useState } from 'react'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
 import {
+  embedQuery,
   matchQaEntriesSemantic,
   matchTrackKnowledgeSemantic,
   parseStreamedSuggestion,
 } from '../lib/contextMatching.js'
+import {
+  candidateTurnClosesQuestion,
+  friendlySuggestionError,
+  isRateLimitError,
+  isWorthASuggestion,
+  parseRetryAfterSeconds,
+  shouldMergeIntoOpenQuestion,
+  splitSuggestionError,
+} from '../lib/turnMerging.js'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL
 // The backend URL is https://... (Render); a WebSocket to the same
@@ -16,22 +26,23 @@ const WS_BASE = API_BASE ? API_BASE.replace(/^http/, 'ws') : ''
 const CALIBRATION_MS = 6000
 
 // Backstop for UtteranceEnd not firing (see utteranceFlushTimer's
-// comment in startSession) -- kept a bit above the backend's own
-// utterance_end_ms (2500ms, in providers.py) so Deepgram's real
-// UtteranceEnd message wins the race and flushes first when it does
-// show up; this only kicks in when it doesn't.
+// comment in startSession) -- kept above the backend's own
+// utterance_end_ms (1500ms, in providers.py) so Deepgram's real
+// UtteranceEnd message wins the race when it does show up. Reset on
+// EVERY transcript message (interim too, not just final), so it can
+// only fire after real silence -- never in the middle of a long,
+// pause-free sentence that Deepgram hasn't finalized yet.
 const UTTERANCE_FALLBACK_MS = 3500
 
-// How long to hold a just-completed INTERVIEWER turn before actually
-// asking for a suggestion (2 Nov) -- a VAD-style grace window so a
-// quick breath/pause mid-question doesn't get treated as the end of
-// it. If another interviewer-attributed segment arrives inside this
-// window, it's appended to the held turn and the window restarts;
-// only once 1.5s passes with nothing further does the merged text
-// actually get sent for a suggestion. A same-speaker continuation
-// restarts the window every time, so a genuinely long multi-part
-// question still only fires once, after the LAST pause.
-const INTERVIEWER_MERGE_WINDOW_MS = 1500
+// How much retrieved material to send per live question -- small on
+// purpose to fit Groq's free-tier 8,000 tokens/minute (see
+// LIVE_CONTEXT_CAPS in providers.py).
+const LIVE_KNOWLEDGE_MATCHES = 4
+const LIVE_QA_MATCHES = 2
+
+// If Groq says "rate limited, try again in N s" and N is at most this,
+// the card waits and retries once by itself.
+const RATE_LIMIT_AUTO_RETRY_MAX_S = 40
 
 // Render's free hosting tier sleeps the backend after ~15 min idle.
 // A Live Copilot session can easily sit quietly for longer than that
@@ -176,14 +187,14 @@ function LiveCopilot() {
   // so reading the `suggestions` state variable directly there could
   // see a stale list; the ref is kept in sync on every render instead.
   const suggestionsRef = useRef([])
-  // The most recently completed INTERVIEWER turn, held back from
-  // triggering a suggestion for a short grace window (2 Nov, VAD-style
-  // merge, in response to "quick pauses breaking one sentence into
-  // multiple"). If another interviewer-attributed segment arrives
-  // before the window elapses, its text is appended to this one and
-  // the window restarts, instead of treating it as a second separate
-  // question. { localTurnId, dbTurnId, text, timer } | null.
-  const pendingMergeRef = useRef(null)
+  // The interviewer's current, still-"open" question: further
+  // interviewer speech merges into it until the candidate replies (see
+  // appendCompletedTurn). { localTurnId, dbTurnId, text,
+  // lastSegmentAt, suggestionId, controller } | null.
+  const openQuestionRef = useRef(null)
+  // Latest Track/Q&A/profile data for runSuggestion (see the comment
+  // there on why it can't just read state). Updated every render.
+  const latestContextRef = useRef({ qaEntries: [], trackKnowledgeChunks: [], selectedTrack: null, profile: null })
   // Auto-scrolls the merged conversation feed to the latest line/card,
   // the same pattern used in ChatbotWidget.jsx.
   const feedScrollRef = useRef(null)
@@ -198,6 +209,15 @@ function LiveCopilot() {
   useEffect(() => {
     suggestionsRef.current = suggestions
   }, [suggestions])
+
+  useEffect(() => {
+    latestContextRef.current = {
+      qaEntries,
+      trackKnowledgeChunks,
+      selectedTrack: tracks.find((t) => t.id === selectedTrackId) || null,
+      profile,
+    }
+  }, [qaEntries, trackKnowledgeChunks, tracks, selectedTrackId, profile])
 
   useEffect(() => {
     if (feedScrollRef.current) {
@@ -270,101 +290,114 @@ function LiveCopilot() {
     return json.text
   }
 
+  // Saves one completed turn to Supabase (fire-and-forget from the
+  // caller's point of view). Resolves to the new row's id, or null.
+  async function saveTurn(speaker, text, localTurnId) {
+    const sid = liveRef.current?.sessionId
+    if (!sid) return null
+    const { data, error: insertError } = await supabase
+      .from('live_turns')
+      .insert({ session_id: sid, speaker, text })
+      .select('id')
+      .single()
+    if (insertError) {
+      console.error('Failed to save turn:', insertError.message)
+      return null
+    }
+    if (mountedRef.current) {
+      setTurns((prev) => prev.map((t) => (t.localTurnId === localTurnId ? { ...t, dbTurnId: data.id } : t)))
+    }
+    return data.id
+  }
+
+  function updateSavedTurnText(dbTurnId, text) {
+    if (!dbTurnId) return
+    supabase
+      .from('live_turns')
+      .update({ text })
+      .eq('id', dbTurnId)
+      .then(({ error: updateError }) => {
+        if (updateError) console.error('Failed to update merged turn:', updateError.message)
+      })
+  }
+
   // A completed utterance (already coalesced by speaker in
-  // handleDeepgramMessage below) is added to the transcript and, for
-  // the candidate's own record, saved.
+  // handleDeepgramMessage below) is added to the transcript and saved.
   //
-  // Interviewer turns don't trigger a suggestion immediately -- they
-  // go through pendingMergeRef's grace window first (see
-  // INTERVIEWER_MERGE_WINDOW_MS above), so a quick pause mid-question
-  // doesn't fire a suggestion on just the first half of it.
+  // HOW INTERVIEWER QUESTIONS ARE GROUPED (2 Nov hygiene pass, replacing
+  // the earlier 1.5s "grace window", which couldn't work: it started
+  // when the FIRST part of a question ended, but the second part only
+  // arrives once it is fully spoken, usually well after 1.5s, so the
+  // two never merged):
+  //   - Deepgram's utterance_end_ms (1.5s of silence, backend) decides
+  //     when a segment has ended.
+  //   - The interviewer's segments keep merging into ONE "open
+  //     question" until the candidate actually replies (more than a
+  //     short "okay"; see turnMerging.js). Each time more is added,
+  //     the suggestion already requested for the shorter version is
+  //     cancelled and a new one is requested for the full text --
+  //     exactly "stop processing the first one and process both
+  //     together".
   async function appendCompletedTurn(speaker, text) {
+    const now = Date.now()
+
     if (speaker === 'interviewer') {
-      const pending = pendingMergeRef.current
-      if (pending) {
-        // Another interviewer segment arrived inside the grace window
-        // -- this is (most likely) a continuation of the same
-        // question after a brief pause, not a second question. Merge
-        // it into the held turn's text and restart the window,
-        // instead of creating a new transcript line / suggestion.
-        if (pending.timer) clearTimeout(pending.timer)
-        pending.text = `${pending.text} ${text}`.trim()
-        setTurns((prev) => prev.map((t) => (t.localTurnId === pending.localTurnId ? { ...t, text: pending.text } : t)))
-        if (pending.dbTurnId) {
-          supabase
-            .from('live_turns')
-            .update({ text: pending.text })
-            .eq('id', pending.dbTurnId)
-            .then(({ error: updateError }) => {
-              if (updateError) console.error('Failed to update merged turn:', updateError.message)
-            })
-        }
-        pending.timer = setTimeout(finalizePendingInterviewerTurn, INTERVIEWER_MERGE_WINDOW_MS)
+      const open = openQuestionRef.current
+      if (shouldMergeIntoOpenQuestion(open, now)) {
+        open.text = `${open.text} ${text}`.trim()
+        open.lastSegmentAt = now
+        setTurns((prev) => prev.map((t) => (t.localTurnId === open.localTurnId ? { ...t, text: open.text } : t)))
+        updateSavedTurnText(open.dbTurnId, open.text)
+        cancelSuggestionFor(open)
+        startSuggestionFor(open)
         return
       }
 
-      // First segment of a (possibly multi-part) interviewer turn --
-      // add it to the transcript and save it right away, same as
-      // before, but hold off on requesting a suggestion for it.
       const localTurnId = ++turnIdRef.current
+      const question = { localTurnId, dbTurnId: null, text, lastSegmentAt: now, suggestionId: null, controller: null }
+      openQuestionRef.current = question
       setTurns((prev) => [...prev, { speaker, text, localTurnId, dbTurnId: null }])
-      const sid = liveRef.current?.sessionId
-      let dbTurnId = null
-      if (sid) {
-        const { data, error: insertError } = await supabase
-          .from('live_turns')
-          .insert({ session_id: sid, speaker, text })
-          .select('id')
-          .single()
-        if (insertError) console.error('Failed to save turn:', insertError.message)
-        else {
-          dbTurnId = data.id
-          setTurns((prev) => prev.map((t) => (t.localTurnId === localTurnId ? { ...t, dbTurnId } : t)))
-        }
-      }
-      pendingMergeRef.current = {
-        localTurnId,
-        dbTurnId,
-        text,
-        timer: setTimeout(finalizePendingInterviewerTurn, INTERVIEWER_MERGE_WINDOW_MS),
-      }
+      // Ask for the suggestion straight away -- don't wait for the
+      // database insert first (that used to add a round-trip of delay).
+      startSuggestionFor(question)
+      const dbTurnId = await saveTurn(speaker, text, localTurnId)
+      question.dbTurnId = dbTurnId
+      // More may have been merged in while the insert was in flight.
+      if (dbTurnId && question.text !== text) updateSavedTurnText(dbTurnId, question.text)
       return
     }
 
-    // speaker === 'you': a speaker change is a clear signal the
-    // interviewer is done for now, so finalize any still-pending
-    // interviewer turn right away instead of waiting out its window.
-    if (pendingMergeRef.current) {
-      finalizePendingInterviewerTurn()
+    // The candidate spoke. A real reply closes the interviewer's open
+    // question; a short "okay"/"yes" (or a single mis-tagged word)
+    // doesn't, so the interviewer's next words still merge into it.
+    if (candidateTurnClosesQuestion(text)) {
+      openQuestionRef.current = null
     }
-
     const localTurnId = ++turnIdRef.current
     setTurns((prev) => [...prev, { speaker, text, localTurnId, dbTurnId: null }])
-    const sid = liveRef.current?.sessionId
-    if (sid) {
-      const { data, error: insertError } = await supabase
-        .from('live_turns')
-        .insert({ session_id: sid, speaker, text })
-        .select('id')
-        .single()
-      if (insertError) console.error('Failed to save turn:', insertError.message)
-      else {
-        const dbTurnId = data.id
-        setTurns((prev) => prev.map((t) => (t.localTurnId === localTurnId ? { ...t, dbTurnId } : t)))
-      }
-    }
+    saveTurn(speaker, text, localTurnId)
   }
 
-  // Ends an interviewer turn's grace window early and actually
-  // requests a suggestion for its (possibly merged) text. Called when
-  // the window naturally elapses, when the candidate starts speaking
-  // (a speaker change), or when the session is ending.
-  function finalizePendingInterviewerTurn() {
-    const pending = pendingMergeRef.current
-    if (!pending) return
-    pendingMergeRef.current = null
-    if (pending.timer) clearTimeout(pending.timer)
-    requestSuggestion(pending.text, pending.dbTurnId, pending.localTurnId)
+  // Requests a suggestion for an open question's CURRENT text, unless
+  // it's too short to be a real question (e.g. "okay" -- see
+  // MIN_QUESTION_WORDS). Remembers the request so a later merge can
+  // cancel it.
+  function startSuggestionFor(question) {
+    if (!isWorthASuggestion(question.text)) return
+    const controller = new AbortController()
+    question.controller = controller
+    question.suggestionId = requestSuggestion(question.text, question, question.localTurnId, controller.signal)
+  }
+
+  // Cancels the in-flight request (if any) and removes its card.
+  function cancelSuggestionFor(question) {
+    if (question.controller) question.controller.abort()
+    const oldId = question.suggestionId
+    if (oldId != null && mountedRef.current) {
+      setSuggestions((prev) => prev.filter((s) => s.id !== oldId))
+    }
+    question.controller = null
+    question.suggestionId = null
   }
 
   // Deepgram's live diarization has no confidence score to catch this
@@ -376,8 +409,7 @@ function LiveCopilot() {
   // turn's speaker. If it's being corrected AWAY from "interviewer",
   // the suggestion that turn wrongly triggered is removed. If it's
   // being corrected TO "interviewer" (it really was their question),
-  // a suggestion is requested for it now, since none was triggered
-  // the first time.
+  // a suggestion is requested for it now.
   // NOTE: side effects (the supabase update, possibly requestSuggestion)
   // deliberately happen OUTSIDE the setTurns updater below -- a setState
   // updater function should stay pure, since React can invoke it more
@@ -388,23 +420,27 @@ function LiveCopilot() {
     const flipped = last.speaker === 'you' ? 'interviewer' : 'you'
     setTurns((prev) => [...prev.slice(0, -1), { ...last, speaker: flipped }])
 
-    // If this turn is still sitting in its merge grace window (no
-    // suggestion requested for it yet), cancel that window -- it's
-    // being corrected by hand, so the automatic merge/finalize logic
-    // shouldn't also act on it.
-    if (pendingMergeRef.current && pendingMergeRef.current.localTurnId === last.localTurnId) {
-      if (pendingMergeRef.current.timer) clearTimeout(pendingMergeRef.current.timer)
-      pendingMergeRef.current = null
-    }
-
+    const open = openQuestionRef.current
     if (last.speaker === 'interviewer' && flipped === 'you') {
+      if (open && open.localTurnId === last.localTurnId) {
+        cancelSuggestionFor(open)
+        openQuestionRef.current = null
+      }
       setSuggestions((prev) => prev.filter((s) => s.localTurnId !== last.localTurnId))
     }
     if (last.speaker === 'you' && flipped === 'interviewer') {
-      // A manual correction -- ask for a suggestion right away rather
-      // than starting a new grace window, since the person doing this
-      // already knows the full question.
-      requestSuggestion(last.text, last.dbTurnId, last.localTurnId)
+      // It really was the interviewer: make it the open question (so
+      // anything more they say merges into it) and ask now.
+      const question = {
+        localTurnId: last.localTurnId,
+        dbTurnId: last.dbTurnId,
+        text: last.text,
+        lastSegmentAt: Date.now(),
+        suggestionId: null,
+        controller: null,
+      }
+      openQuestionRef.current = question
+      startSuggestionFor(question)
     }
     if (last.dbTurnId) {
       supabase
@@ -417,80 +453,151 @@ function LiveCopilot() {
     }
   }
 
-  // Reads the response over the same streamed connection as before
-  // (no backend change needed), but -- per Devanshu's request (2 Nov,
-  // "I dont want streaming... difficult to focus on") -- no longer
-  // updates the UI chunk by chunk as it arrives. The card just shows
-  // "typing..." the whole time and then the FULL quick points +
-  // answer appear at once, only after the response is completely
-  // generated.
-  async function requestSuggestion(question, turnId, localTurnId) {
+  // "Retry" on a failed card: drop it and ask again for that turn.
+  function retrySuggestion(s) {
+    const turn = turns.find((t) => t.localTurnId === s.localTurnId)
+    if (!turn) return
+    setSuggestions((prev) => prev.filter((x) => x.id !== s.id))
+    const open = openQuestionRef.current
+    if (open && open.localTurnId === turn.localTurnId) {
+      cancelSuggestionFor(open)
+      startSuggestionFor(open)
+    } else {
+      requestSuggestion(turn.text, { dbTurnId: turn.dbTurnId }, turn.localTurnId, undefined)
+    }
+  }
+
+  // Creates the suggestion card right away (showing "thinking…") and
+  // fills it in once the reply is COMPLETE -- per Devanshu's request
+  // (2 Nov) the text is no longer shown growing live; the full quick
+  // points + answer appear at once. Returns the card's id
+  // synchronously so a merge can cancel it.
+  //   turnRef: an object whose .dbTurnId is read at save time (it may
+  //            only become known after the request started).
+  //   signal:  AbortSignal -- aborted when this question gets merged
+  //            with more of the interviewer's speech.
+  function requestSuggestion(question, turnRef, localTurnId, signal, attempt = 1) {
     const id = ++suggestionIdRef.current
-    const placeholder = { id, question, quickPointers: [], suggestedAnswer: '', streaming: true, localTurnId }
+    const placeholder = {
+      id,
+      question,
+      quickPointers: [],
+      suggestedAnswer: '',
+      streaming: true,
+      error: null,
+      retryInSeconds: null,
+      localTurnId,
+    }
     if (mountedRef.current) setSuggestions((prev) => [...prev, placeholder])
+    runSuggestion(id, question, turnRef, signal, attempt)
+    return id
+  }
+
+  async function runSuggestion(id, question, turnRef, signal, attempt) {
+    const updateCard = (patch) => {
+      if (mountedRef.current) setSuggestions((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)))
+    }
+    // Read the latest Track/Q&A/profile data from a ref, not from this
+    // render's variables: this function is reached from the websocket
+    // handler bound when the session STARTED, so plain state here could
+    // be stale (e.g. knowledge-base chunks that finished loading just
+    // after you pressed Start would otherwise never be used).
+    const ctx = latestContextRef.current
 
     let fullText = ''
+    let failure = null
     try {
-      // Run both lookups in parallel (2 Nov latency fix) instead of
-      // one-after-the-other -- they're independent, so awaiting them
-      // sequentially was paying for two full network round-trips back
-      // to back before the suggestion could even start. { rerank:
-      // false } skips the extra LLM reranking round-trip entirely --
-      // see matchTrackKnowledgeSemantic's useRerank comment -- since a
-      // real interview can't afford that latency the way testing in
-      // the Chatbot widget can; the hybrid (semantic+keyword via RRF)
-      // order is still used, just without the extra LLM pass on top.
+      // Embed the question ONCE and reuse it for both lookups (used to
+      // be two identical embedding requests). Lookups run in parallel,
+      // and Live Copilot skips the extra LLM rerank for speed.
+      const queryEmbedding = await embedQuery(API_BASE, question)
       const [matchedQa, matchedKnowledge] = await Promise.all([
-        matchQaEntriesSemantic(API_BASE, question, qaEntries),
-        matchTrackKnowledgeSemantic(API_BASE, question, trackKnowledgeChunks, { rerank: false }),
+        matchQaEntriesSemantic(API_BASE, question, ctx.qaEntries, { queryEmbedding }),
+        matchTrackKnowledgeSemantic(API_BASE, question, ctx.trackKnowledgeChunks, { rerank: false, queryEmbedding }),
       ])
-      const qaContext = matchedQa.map((e) => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
-      const knowledgeContext = matchedKnowledge.map((c) => c.chunk_text).join('\n\n')
+      // Fewer, better chunks: the whole prompt has to fit Groq's
+      // 8,000-tokens-per-minute free tier (see LIVE_CONTEXT_CAPS in
+      // providers.py), so send the top few rather than everything.
+      const qaContext = matchedQa
+        .slice(0, LIVE_QA_MATCHES)
+        .map((e) => `Q: ${e.question}\nA: ${e.answer}`)
+        .join('\n\n')
+      const knowledgeContext = matchedKnowledge
+        .slice(0, LIVE_KNOWLEDGE_MATCHES)
+        .map((c) => c.chunk_text)
+        .join('\n\n')
       // Read from the ref, not the `suggestions` state variable --
       // see suggestionsRef's comment above. No extra round-trip: this
       // just adds a field to the POST body already being sent below.
       const conversationHistory = buildConversationHistory(suggestionsRef.current)
+      if (signal?.aborted) return
       const res = await fetch(`${API_BASE}/api/live-suggestion`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal,
         body: JSON.stringify({
           question,
-          company_name: selectedTrack?.company_name || '',
-          role_title: selectedTrack?.role_title || '',
+          company_name: ctx.selectedTrack?.company_name || '',
+          role_title: ctx.selectedTrack?.role_title || '',
           jd_text: liveRef.current?.jdText || '',
           resume_text: liveRef.current?.resumeText || '',
           qa_context: qaContext,
-          profile_summary: profile?.summary || '',
-          track_notes: selectedTrack?.notes || '',
+          profile_summary: ctx.profile?.summary || '',
+          track_notes: ctx.selectedTrack?.notes || '',
           knowledge_context: knowledgeContext,
           conversation_history: conversationHistory,
         }),
       })
+      if (!res.ok) throw new Error(`Server error ${res.status}`)
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
+        // Accumulate only -- the card is filled in once, below.
         fullText += decoder.decode(value, { stream: true })
-        // Intentionally no setSuggestions() here -- fullText is only
-        // accumulated as chunks arrive; the card stays on "typing..."
-        // until the loop ends below, instead of updating live.
       }
     } catch (err) {
-      console.error('Suggestion error:', err.message)
+      // A merge cancelled this request on purpose: its card is already
+      // gone and a new request has replaced it -- nothing to show.
+      if (signal?.aborted || err?.name === 'AbortError') return
+      failure = err?.message || 'Network error'
+    }
+    if (signal?.aborted) return
+
+    const { text, error: backendError } = splitSuggestionError(fullText)
+    const final = parseStreamedSuggestion(text)
+    const gotSomething = final.quickPointers.length > 0 || final.suggestedAnswer
+    const errorText = backendError || failure || (gotSomething ? null : 'No suggestion came back.')
+
+    if (errorText && !gotSomething) {
+      // Rate-limited: wait out Groq's "try again in Ns" and retry once
+      // automatically, instead of leaving an empty card mid-interview.
+      const waitS = parseRetryAfterSeconds(errorText)
+      if (isRateLimitError(errorText) && attempt === 1 && waitS != null && waitS <= RATE_LIMIT_AUTO_RETRY_MAX_S) {
+        updateCard({ error: friendlySuggestionError(errorText), retryInSeconds: waitS })
+        setTimeout(() => {
+          if (signal?.aborted || !mountedRef.current) return
+          updateCard({ error: null, retryInSeconds: null })
+          runSuggestion(id, question, turnRef, signal, attempt + 1)
+        }, waitS * 1000)
+        return
+      }
+      console.error('Suggestion error:', errorText)
+      updateCard({ streaming: false, error: friendlySuggestionError(errorText), retryInSeconds: null })
+      return
     }
 
-    const final = parseStreamedSuggestion(fullText)
-    if (mountedRef.current) {
-      setSuggestions((prev) => prev.map((s) => (s.id === id ? { ...s, ...final, streaming: false } : s)))
-    }
+    updateCard({ ...final, streaming: false, error: null, retryInSeconds: null })
 
     const sid = liveRef.current?.sessionId
-    if (sid && (final.quickPointers.length > 0 || final.suggestedAnswer)) {
+    if (sid) {
       const { error: insertError } = await supabase.from('live_suggestions').insert({
         session_id: sid,
-        turn_id: turnId,
-        quick_pointers: final.quickPointers,
+        turn_id: turnRef?.dbTurnId ?? null,
+        // Saved as plain strings ("point — explanation"), the same
+        // shape this column has always held, whatever its SQL type.
+        quick_pointers: final.quickPointers.map((p) => (p.explanation ? `${p.point} — ${p.explanation}` : p.point)),
         suggested_answer: final.suggestedAnswer,
       })
       if (insertError) console.error('Failed to save suggestion:', insertError.message)
@@ -584,6 +691,15 @@ function LiveCopilot() {
         const confirmed = state.currentBuffer && state.currentBuffer.speaker === speakerTag ? state.currentBuffer.text + ' ' : ''
         setLiveLine({ speaker: speakerTag, text: confirmed + alt.transcript, interim: true })
       }
+      // Someone is still talking -- push the safety-net flush back so
+      // it can't cut a long, pause-free sentence in half just because
+      // Deepgram hasn't sent a "final" for it yet (a likely cause of
+      // mid-sentence splits like "could you tell me about | time you
+      // had to...").
+      if (state.currentBuffer) {
+        if (state.utteranceFlushTimer) clearTimeout(state.utteranceFlushTimer)
+        state.utteranceFlushTimer = setTimeout(() => flushCurrentBuffer(), UTTERANCE_FALLBACK_MS)
+      }
       return
     }
 
@@ -613,8 +729,7 @@ function LiveCopilot() {
     setConnectionState('connected')
     setReconnectAttempt(0)
     setStatus('preparing')
-    if (pendingMergeRef.current?.timer) clearTimeout(pendingMergeRef.current.timer)
-    pendingMergeRef.current = null
+    openQuestionRef.current = null
 
     let resumeText = ''
     let jdText = selectedTrack?.jd_text || ''
@@ -935,12 +1050,7 @@ function LiveCopilot() {
     if (state.pauseKeepAliveTimer) clearInterval(state.pauseKeepAliveTimer)
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
     flushCurrentBuffer()
-    // The session is ending -- don't leave the last interviewer turn
-    // waiting out its merge window with nobody left to see the
-    // suggestion arrive; ask for it now instead of dropping it.
-    if (pendingMergeRef.current) {
-      finalizePendingInterviewerTurn()
-    }
+    openQuestionRef.current = null
     try {
       state.ws && state.ws.close()
     } catch (e) {
@@ -998,8 +1108,8 @@ function LiveCopilot() {
     setPaused(false)
     setConnectionState('connected')
     setReconnectAttempt(0)
-    if (pendingMergeRef.current?.timer) clearTimeout(pendingMergeRef.current.timer)
-    pendingMergeRef.current = null
+    if (openQuestionRef.current) cancelSuggestionFor(openQuestionRef.current)
+    openQuestionRef.current = null
   }
 
   // One chronological, conversation-style feed instead of two separate
@@ -1100,7 +1210,22 @@ function LiveCopilot() {
                 key={item.key}
                 className={item.suggestion.streaming ? 'suggestion-card is-latest' : 'suggestion-card'}
               >
-                {item.suggestion.streaming && <div className="suggestion-label">typing…</div>}
+                {item.suggestion.streaming && !item.suggestion.retryInSeconds && (
+                  <div className="suggestion-label">thinking…</div>
+                )}
+                {item.suggestion.retryInSeconds != null && (
+                  <p className="suggestion-error">
+                    {item.suggestion.error} Retrying automatically in ~{item.suggestion.retryInSeconds}s…
+                  </p>
+                )}
+                {!item.suggestion.streaming && item.suggestion.error && (
+                  <p className="suggestion-error">
+                    Couldn't get a suggestion: {item.suggestion.error}{' '}
+                    <button type="button" className="link-button" onClick={() => retrySuggestion(item.suggestion)}>
+                      Retry
+                    </button>
+                  </p>
+                )}
                 {item.suggestion.quickPointers.length > 0 && (
                   <table className="suggestion-points-table">
                     <tbody>

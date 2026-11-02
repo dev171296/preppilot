@@ -58,7 +58,7 @@ export function cosineSimilarity(a, b) {
 }
 
 function tokenize(text) {
-  return (text.toLowerCase().match(/[a-z0-9]+/g) || [])
+  return ((text || '').toLowerCase().match(/[a-z0-9]+/g) || [])
 }
 
 // Simplified TF-IDF-style keyword relevance (2 Nov hybrid-search pass,
@@ -119,22 +119,32 @@ function reciprocalRankFusion(rankedKeyLists) {
 // this replaces. Entries that don't have an embedding yet (e.g. added
 // right before this upgrade shipped, still being backfilled) are
 // simply skipped rather than causing an error.
-export async function matchQaEntriesSemantic(apiBase, question, qaEntries) {
-  const withEmbeddings = qaEntries.filter((e) => Array.isArray(e.embedding) && e.embedding.length > 0)
-  if (withEmbeddings.length === 0) return []
-  let questionEmbedding
+// Embeds a live question (input_type "query"). Returns the vector, or
+// null if the embedding service failed -- callers then just skip
+// retrieval rather than failing the whole suggestion.
+export async function embedQuery(apiBase, text) {
   try {
     const res = await fetch(`${apiBase}/api/embed-text`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: question, input_type: 'query' }),
+      body: JSON.stringify({ text, input_type: 'query' }),
     })
-    if (!res.ok) return []
+    if (!res.ok) return null
     const json = await res.json()
-    questionEmbedding = json.embedding
+    return Array.isArray(json.embedding) && json.embedding.length > 0 ? json.embedding : null
   } catch {
-    return []
+    return null
   }
+}
+
+export async function matchQaEntriesSemantic(apiBase, question, qaEntries, opts = {}) {
+  const withEmbeddings = qaEntries.filter((e) => Array.isArray(e.embedding) && e.embedding.length > 0)
+  if (withEmbeddings.length === 0) return []
+  // A caller that needs BOTH lookups for the same text (Live Copilot)
+  // embeds it once via embedQuery() and passes it in, instead of
+  // paying for two identical embedding requests.
+  const questionEmbedding = opts.queryEmbedding || (await embedQuery(apiBase, question))
+  if (!questionEmbedding) return []
   const scored = withEmbeddings
     .map((e) => ({ entry: e, similarity: cosineSimilarity(questionEmbedding, e.embedding) }))
     .filter((s) => s.similarity >= MIN_SIMILARITY)
@@ -173,19 +183,12 @@ export async function matchTrackKnowledgeSemantic(apiBase, question, chunks, opt
   const useRerank = opts.rerank !== false
   const withEmbeddings = chunks.filter((c) => Array.isArray(c.embedding) && c.embedding.length > 0)
   if (withEmbeddings.length === 0) return []
-  let questionEmbedding
-  try {
-    const res = await fetch(`${apiBase}/api/embed-text`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: question, input_type: 'query' }),
-    })
-    if (!res.ok) return []
-    const json = await res.json()
-    questionEmbedding = json.embedding
-  } catch {
-    return []
-  }
+  // A caller that needs BOTH lookups for the same text (Live Copilot)
+  // embeds it once via embedQuery() and passes it in, instead of
+  // paying for two identical embedding requests.
+  // If embedding fails, keyword search below still runs on its own
+  // instead of dropping all knowledge-base context.
+  const questionEmbedding = opts.queryEmbedding || (await embedQuery(apiBase, question))
 
   // Hybrid search (2 Nov, following the shared RAG best-practices doc's
   // T11): two independent rankings over the SAME chunks -- semantic
@@ -193,10 +196,12 @@ export async function matchTrackKnowledgeSemantic(apiBase, question, chunks, opt
   // TF-IDF-style score) -- since each catches relevant chunks the other
   // can miss. Neither list alone decides what's "in"; a chunk only
   // needs to rank well on EITHER to reach the merge step below.
-  const semanticRanked = withEmbeddings
-    .map((c) => ({ chunk: c, similarity: cosineSimilarity(questionEmbedding, c.embedding) }))
-    .sort((a, b) => b.similarity - a.similarity)
-    .slice(0, HYBRID_SHORTLIST_SIZE)
+  const semanticRanked = questionEmbedding
+    ? withEmbeddings
+        .map((c) => ({ chunk: c, similarity: cosineSimilarity(questionEmbedding, c.embedding) }))
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, HYBRID_SHORTLIST_SIZE)
+    : []
   const kwScores = keywordScores(question, withEmbeddings.map((c) => c.chunk_text))
   const keywordRanked = withEmbeddings
     .map((c, i) => ({ chunk: c, keywordScore: kwScores[i] }))

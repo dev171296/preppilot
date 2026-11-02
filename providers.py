@@ -353,8 +353,29 @@ def score_interview_session_summary(answers: list) -> dict:
 # never competes with anything else for a shared key's rate limit --
 # and speed matters even more here, since a suggestion needs to show
 # up on screen WHILE the real interview is still happening.
-# How many of the conversation's prior turns to actually include (2 Nov, Chatbot-widget conversational-memory pass) -- caps the prompt size for a long test chat; 6 messages is 3 full exchanges, plenty for a follow-up like "and if I missed it?" to still make sense.
-CONVERSATION_HISTORY_LIMIT = 6
+# How many of the conversation's prior turns to actually include, and
+# how long each may be. 4 messages = 2 full exchanges -- enough for a
+# follow-up like "and the second one?" to make sense.
+CONVERSATION_HISTORY_LIMIT = 4
+CONVERSATION_TURN_MAX_CHARS = 400
+
+# TOKEN BUDGET (2 Nov hygiene pass -- root cause of "no suggestion for
+# a lot of questions"): Groq's free tier allows only 8,000 tokens PER
+# MINUTE for openai/gpt-oss-120b (console.groq.com/docs/rate-limits,
+# checked 2 Nov 2026), counting the prompt AND the reply (including the
+# model's hidden reasoning). The old caps let one request reach ~6-8K
+# tokens, so a second question within the same minute was rejected
+# (429). These caps keep a typical request around ~3K tokens so ~2-3
+# suggestions fit per minute. Characters, roughly 4 chars per token.
+LIVE_CONTEXT_CAPS = {
+    "jd_text": 1200,
+    "resume_text": 1800,
+    "profile_summary": 1000,
+    "track_notes": 1500,
+    "knowledge_context": 4000,
+    "qa_context": 1500,
+}
+LIVE_MAX_COMPLETION_TOKENS = 1024
 
 
 def stream_live_suggestion_chunks(question: str, context: dict, conversation_history: list[dict] | None = None):
@@ -391,25 +412,26 @@ def stream_live_suggestion_chunks(question: str, context: dict, conversation_his
     if role or company:
         context_lines.append("### ROLE ###\n" + f"Role: {role}" + (f" at {company}" if company else ""))
     if context.get("jd_text"):
-        context_lines.append("### JOB DESCRIPTION ###\n" + context["jd_text"][:3000])
+        context_lines.append("### JOB DESCRIPTION ###\n" + context["jd_text"][: LIVE_CONTEXT_CAPS["jd_text"]])
     if context.get("resume_text"):
-        context_lines.append("### CANDIDATE RESUME ###\n" + context["resume_text"][:3000])
+        context_lines.append("### CANDIDATE RESUME ###\n" + context["resume_text"][: LIVE_CONTEXT_CAPS["resume_text"]])
     if context.get("profile_summary"):
         # General bio from the Profile screen -- not tied to any one
         # company/role, same text Mock Interview's system instruction
         # already uses.
-        context_lines.append("### ABOUT THE CANDIDATE (general) ###\n" + context["profile_summary"][:2000])
+        context_lines.append("### ABOUT THE CANDIDATE (general) ###\n" + context["profile_summary"][: LIVE_CONTEXT_CAPS["profile_summary"]])
     if context.get("track_notes"):
         # Free-text notes the candidate wrote specifically for THIS
         # Track (company/role) -- things that don't belong in the
         # general Profile summary or the JD itself.
         context_lines.append(
-            "### CANDIDATE'S OWN NOTES FOR THIS SPECIFIC COMPANY/ROLE ###\n" + context["track_notes"][:2000]
+            "### CANDIDATE'S OWN NOTES FOR THIS SPECIFIC COMPANY/ROLE ###\n" + context["track_notes"][: LIVE_CONTEXT_CAPS["track_notes"]]
         )
     if context.get("knowledge_context"):
         # The frontend already ran a two-stage retrieval over this
         # Track's (possibly very large, 100k+ character) knowledge base
-        # -- cosine similarity shortlist, then an LLM rerank pass -- and
+        # -- hybrid semantic+keyword search (plus an LLM rerank pass for
+        # the Chatbot widget only; Live Copilot skips it for speed) -- and
         # picked the chunks most relevant to THIS question (see
         # matchTrackKnowledgeSemantic in contextMatching.js). Raised
         # 8000->16000 (2 Nov RAG-quality pass) since MAX_TRACK_KNOWLEDGE_
@@ -418,7 +440,7 @@ def stream_live_suggestion_chunks(question: str, context: dict, conversation_his
         # under normal use.
         context_lines.append(
             "### RELEVANT BACKGROUND/REFERENCE MATERIAL FOR THIS COMPANY/ROLE ###\n"
-            + context["knowledge_context"][:16000]
+            + context["knowledge_context"][: LIVE_CONTEXT_CAPS["knowledge_context"]]
         )
     if context.get("qa_context"):
         # Pre-matched (on the frontend, by semantic search against
@@ -427,7 +449,7 @@ def stream_live_suggestion_chunks(question: str, context: dict, conversation_his
         # last client" that don't belong on any one Track.
         context_lines.append(
             "### CANDIDATE'S OWN PRE-WRITTEN ANSWERS (use verbatim/near-verbatim if one matches) ###\n"
-            + context["qa_context"][:3000]
+            + context["qa_context"][: LIVE_CONTEXT_CAPS["qa_context"]]
         )
     context_block = "\n\n".join(context_lines)
 
@@ -470,8 +492,7 @@ def stream_live_suggestion_chunks(question: str, context: dict, conversation_his
         + f"The interviewer just asked: {question}"
     )
 
-    # Prior turns (Chatbot widget only -- see conversation_history's
-    # docstring note in LiveSuggestionRequest) are sent as REAL separate
+    # Prior turns (sent by both Live Copilot and the Chatbot widget) are sent as REAL separate
     # chat messages, not crammed into one block of text, so the model
     # actually sees this as an ongoing conversation rather than a pile
     # of unrelated context. Only the last CONVERSATION_HISTORY_LIMIT
@@ -482,19 +503,32 @@ def stream_live_suggestion_chunks(question: str, context: dict, conversation_his
         role = "assistant" if turn.get("role") == "assistant" else "user"
         content = (turn.get("content") or "").strip()
         if content:
-            messages.append({"role": role, "content": content[:1500]})
+            messages.append({"role": role, "content": content[:CONVERSATION_TURN_MAX_CHARS]})
     messages.append({"role": "user", "content": user_prompt})
 
     try:
+        # max_retries=0: the OpenAI client otherwise silently RETRIES a
+        # 429 (rate limit) after sleeping for Groq's "try again in Ns"
+        # -- up to ~1-2 minutes with no bytes sent, long enough for the
+        # browser/proxy to drop the connection, which showed up as an
+        # EMPTY suggestion card with no error. Failing fast instead
+        # returns a clear error the frontend can show and auto-retry.
         client = OpenAI(
             api_key=os.environ["GROQ_API_KEY"],
             base_url="https://api.groq.com/openai/v1",
             timeout=REQUEST_TIMEOUT_S,
+            max_retries=0,
         )
         stream = client.chat.completions.create(
             model=SCORING_MODEL,
             messages=messages,
             stream=True,
+            # gpt-oss is a reasoning model; "low" effort (documented for
+            # GPT-OSS at console.groq.com/docs/reasoning) cuts both the
+            # hidden thinking time before the first word AND the tokens
+            # it burns from the 8K/minute budget.
+            reasoning_effort="low",
+            max_completion_tokens=LIVE_MAX_COMPLETION_TOKENS,
         )
         for chunk in stream:
             if not chunk.choices:
@@ -874,10 +908,16 @@ def run_realtime_test(provider_key: str) -> dict:
 DEEPGRAM_MODEL = "nova-3"
 
 # See the "utterance_end_ms" note in stream_deepgram_stt's docstring
-# below -- Deepgram's allowed range is 1000-5000ms; 2500 is a middle
-# ground between quick turn-detection and not splitting a single
-# sentence into several on a mid-sentence pause.
-UTTERANCE_END_MS = 2500
+# below -- Deepgram's allowed range is 1000-5000ms. This is the
+# "silence before we treat someone as done talking" threshold (Deepgram
+# computes it from word timings, so it acts as voice-activity
+# detection). 1500ms per Devanshu's explicit ask (2 Nov). It no longer
+# needs to be large to avoid split questions: the frontend now MERGES
+# consecutive interviewer segments into one question (cancelling and
+# re-requesting the suggestion) until the candidate actually speaks,
+# so a long pause can't split a question any more -- it just costs one
+# re-request.
+UTTERANCE_END_MS = 1500
 
 
 async def stream_deepgram_stt(browser_ws, language: str | None = None, diarize: bool = False) -> None:
