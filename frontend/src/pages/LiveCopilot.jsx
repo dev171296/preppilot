@@ -44,6 +44,10 @@ const LIVE_QA_MATCHES = 2
 // the card waits and retries once by itself.
 const RATE_LIMIT_AUTO_RETRY_MAX_S = 40
 
+// When a suggestion card scrolls into view, leave this much of the
+// question visible above it.
+const CARD_SCROLL_PEEK_PX = 48
+
 // Render's free hosting tier sleeps the backend after ~15 min idle.
 // A Live Copilot session can easily sit quietly for longer than that
 // while waiting for the interviewer to actually start talking (mic on,
@@ -198,6 +202,8 @@ function LiveCopilot() {
   // Auto-scrolls the merged conversation feed to the latest line/card,
   // the same pattern used in ChatbotWidget.jsx.
   const feedScrollRef = useRef(null)
+  // What the feed last scrolled for -- see the scrolling effect below.
+  const lastScrollKeysRef = useRef({ card: null, interviewer: null })
 
   useEffect(() => {
     mountedRef.current = true
@@ -220,9 +226,35 @@ function LiveCopilot() {
   }, [qaEntries, trackKnowledgeChunks, tracks, selectedTrackId, profile])
 
   useEffect(() => {
-    if (feedScrollRef.current) {
-      feedScrollRef.current.scrollTop = feedScrollRef.current.scrollHeight
+    // Scrolls ONLY for things worth looking at (2 Nov, after "I see the
+    // bottom of the response" and "the screen keeps moving while I
+    // speak"):
+    //   1. A suggestion card appears / finishes / errors -> scroll so
+    //      the TOP of that card (the table) is at the top of the feed,
+    //      with the end of the question just above it.
+    //   2. The interviewer is talking (new/longer interviewer line) ->
+    //      scroll to the bottom so the question is visible.
+    // The candidate's own speech never moves the feed, so the answer
+    // stays put while you read it out.
+    const feed = feedScrollRef.current
+    if (!feed) return
+    const latest = suggestions[suggestions.length - 1]
+    const cardKey = latest ? `${latest.id}:${latest.streaming}:${latest.error ? 'e' : ''}` : null
+    const interviewerTurns = turns.filter((t) => t.speaker === 'interviewer')
+    const lastQuestion = interviewerTurns[interviewerTurns.length - 1]
+    const interviewerKey = [
+      interviewerTurns.length,
+      lastQuestion ? lastQuestion.text.length : 0,
+      liveLine && liveLine.speaker === 'interviewer' ? liveLine.text.length : 0,
+    ].join(':')
+    const prev = lastScrollKeysRef.current
+    if (latest && cardKey !== prev.card) {
+      const card = feed.querySelector(`[data-suggestion-id="${latest.id}"]`)
+      if (card) feed.scrollTop = Math.max(0, card.offsetTop - CARD_SCROLL_PEEK_PX)
+    } else if (interviewerKey !== prev.interviewer) {
+      feed.scrollTop = feed.scrollHeight
     }
+    lastScrollKeysRef.current = { card: cardKey, interviewer: interviewerKey }
   }, [turns, suggestions, liveLine])
 
   useEffect(() => {
@@ -1208,6 +1240,7 @@ function LiveCopilot() {
             ) : (
               <div
                 key={item.key}
+                data-suggestion-id={item.suggestion.id}
                 className={item.suggestion.streaming ? 'suggestion-card is-latest' : 'suggestion-card'}
               >
                 {item.suggestion.streaming && !item.suggestion.retryInSeconds && (
@@ -1244,7 +1277,10 @@ function LiveCopilot() {
               </div>
             )
           )}
-          {liveLine && (
+          {/* Your own words aren't shown while you're still saying them
+              (distracting, and they used to push the answer off-screen);
+              they appear as a normal line once you finish. */}
+          {liveLine && liveLine.speaker !== 'you' && (
             <p
               className={`feed-turn feed-turn-${liveLine.speaker}`}
               style={{ opacity: liveLine.interim ? 0.55 : 0.8, fontStyle: liveLine.interim ? 'italic' : 'normal' }}

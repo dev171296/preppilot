@@ -232,6 +232,9 @@ button:disabled {
    scrollable, auto-scrolling thread: transcript lines interleaved
    with the suggestion card each interviewer question triggered. */
 .conversation-feed {
+  /* positioned so each card's offsetTop is measured from the feed --
+     used to scroll a new answer's TOP into view */
+  position: relative;
   border: 1px solid #1e293b;
   border-radius: 8px;
   padding: 1rem;
