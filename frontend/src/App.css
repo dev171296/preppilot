@@ -227,23 +227,56 @@ button:disabled {
   margin: 0;
 }
 
-/* Merged conversation-style feed in Live Copilot (2 Nov) -- replaces
-   the old separate "Suggestions" + "Transcript" blocks with one
-   scrollable, auto-scrolling thread: transcript lines interleaved
-   with the suggestion card each interviewer question triggered. */
-.conversation-feed {
-  /* positioned so each card's offsetTop is measured from the feed --
-     used to scroll a new answer's TOP into view */
-  position: relative;
-  border: 1px solid #1e293b;
-  border-radius: 8px;
-  padding: 1rem;
-  margin-top: 1rem;
-  max-height: 60vh;
-  overflow-y: auto;
+/* Live Copilot during a session (3 Nov): one normal page, no inner
+   scroll box. Newest question + answer first, right under the
+   controls; earlier ones below, dimmed. */
+.copilot-controls {
   display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0 0 0.5rem 0;
+}
+
+.copilot-controls button {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.copilot-hearing {
+  /* fixed single line so nothing below moves while the interviewer talks */
+  height: 1.4em;
+  margin: 0 0 0.4rem 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.85rem;
+  font-style: italic;
+  color: #94a3b8;
+}
+
+.copilot-empty {
+  color: #64748b;
+  font-size: 0.9rem;
+}
+
+.suggestion-card.is-earlier {
+  opacity: 0.55;
+}
+
+.suggestion-card.is-latest .suggestion-answer {
+  font-size: 1.02rem;
+  line-height: 1.45;
+}
+
+.copilot-transcript {
+  margin-top: 1.2rem;
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+
+.copilot-transcript summary {
+  cursor: pointer;
 }
 
 .feed-turn {

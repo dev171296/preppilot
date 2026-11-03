@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
 import {
@@ -79,6 +80,7 @@ function buildRetrievalQuery(priorMessages, question) {
 }
 function ChatbotWidget() {
   const { session, profile } = useAuth()
+  const location = useLocation()
   const [open, setOpen] = useState(false)
   const [tracks, setTracks] = useState([])
   const [selectedTrackId, setSelectedTrackId] = useState('')
@@ -248,7 +250,9 @@ function ChatbotWidget() {
   // Not shown at all when logged out -- there's no resume/JD/Track
   // context to ground anything with, and the backend route needs a
   // question either way.
-  if (!session || !API_BASE) return null
+  // Hidden on the Live Copilot screen -- the floating button covered
+  // part of the answer during a real interview (3 Nov).
+  if (!session || !API_BASE || location.pathname === '/live-copilot') return null
 
   return (
     <div className="chatbot-widget">
