@@ -11,6 +11,7 @@ import {
   candidateTurnClosesQuestion,
   friendlySuggestionError,
   isRateLimitError,
+  isLikelyEcho,
   isWorthASuggestion,
   parseRetryAfterSeconds,
   shouldMergeIntoOpenQuestion,
@@ -34,11 +35,51 @@ const CALIBRATION_MS = 6000
 // pause-free sentence that Deepgram hasn't finalized yet.
 const UTTERANCE_FALLBACK_MS = 3500
 
-// How much retrieved material to send per live question -- small on
-// purpose to fit Groq's free-tier 8,000 tokens/minute (see
-// LIVE_CONTEXT_CAPS in providers.py).
-const LIVE_KNOWLEDGE_MATCHES = 4
-const LIVE_QA_MATCHES = 2
+// How much retrieved material to send per live question, by the
+// chosen model's "budget" (see LIVE_MODELS in providers.py): Groq's
+// free tier only allows 8,000 tokens/minute, so it gets less; Gemini
+// and NVIDIA get more, for better-grounded answers.
+const LIVE_MATCHES = {
+  tight: { knowledge: 4, qa: 2 },
+  roomy: { knowledge: 8, qa: 3 },
+}
+
+// Used only if /api/live-models can't be reached; mirrors LIVE_MODELS.
+const FALLBACK_LIVE_MODELS = [
+  { key: 'groq-gpt-oss-120b', label: 'Groq · GPT-OSS 120B (default)', budget: 'tight', available: true },
+]
+const DEFAULT_LIVE_MODEL = 'groq-gpt-oss-120b'
+
+// Where the interview is happening (chosen before starting):
+//   same-device:  Meet/Zoom in Chrome on this laptop -- mic = you,
+//                 captured tab audio = interviewer (two channels, no
+//                 voice-guessing, no calibration).
+//   other-device: phone / another computer / in person -- one mic
+//                 hears both, Deepgram tells the voices apart.
+const INPUT_MODES = { SAME: 'same-device', OTHER: 'other-device' }
+
+// How much of the interviewer's recent speech the echo filter compares
+// the mic against (see isLikelyEcho in turnMerging.js).
+const ECHO_LOOKBACK_MS = 15000
+
+// Remembered setup choices (per browser; harmless if storage is blocked).
+function loadPref(key, fallback) {
+  try {
+    return window.localStorage.getItem(key) || fallback
+  } catch {
+    return fallback
+  }
+}
+function savePref(key, value) {
+  try {
+    window.localStorage.setItem(key, value)
+  } catch {
+    /* storage blocked -- the choice just isn't remembered */
+  }
+}
+
+// Tab/window audio capture exists only in desktop browsers (not iPhone).
+const CAN_CAPTURE_TAB_AUDIO = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia
 
 // If Groq says "rate limited, try again in N s" and N is at most this,
 // the card waits and retries once by itself.
@@ -111,12 +152,13 @@ function buildConversationHistory(priorSuggestions) {
 // processor.onaudioprocess below, which calls this instead of
 // silently dropping the audio the way it used to.
 function bufferAudioChunk(state, buffer) {
-  const seconds = buffer.byteLength / 2 / 16000 // 16-bit samples, 16kHz
+  const channels = state.channels || 1
+  const seconds = buffer.byteLength / 2 / 16000 / channels // 16-bit samples, 16kHz, per channel
   state.pendingAudioChunks.push(buffer)
   state.pendingAudioSeconds += seconds
   while (state.pendingAudioSeconds > MAX_BUFFERED_AUDIO_SECONDS && state.pendingAudioChunks.length > 1) {
     const dropped = state.pendingAudioChunks.shift()
-    state.pendingAudioSeconds -= dropped.byteLength / 2 / 16000
+    state.pendingAudioSeconds -= dropped.byteLength / 2 / 16000 / channels
   }
 }
 
@@ -177,6 +219,14 @@ function LiveCopilot() {
   // speaker change/UtteranceEnd to flush the whole turn to `turns`
   // below -- so the transcript appears live instead of all at once.
   const [liveLine, setLiveLine] = useState(null) // {speaker, text}
+  const [inputMode, setInputMode] = useState(() =>
+    CAN_CAPTURE_TAB_AUDIO ? loadPref('liveCopilot.inputMode', INPUT_MODES.OTHER) : INPUT_MODES.OTHER,
+  )
+  const [liveModels, setLiveModels] = useState(FALLBACK_LIVE_MODELS)
+  const [selectedModel, setSelectedModel] = useState(() => loadPref('liveCopilot.model', DEFAULT_LIVE_MODEL))
+  // Read by runSuggestion (see latestContextRef for why a ref).
+  const selectedModelRef = useRef(selectedModel)
+  const liveModelsRef = useRef(FALLBACK_LIVE_MODELS)
   const liveRef = useRef(null)
   const mountedRef = useRef(true)
   const suggestionIdRef = useRef(0)
@@ -206,6 +256,27 @@ function LiveCopilot() {
   useEffect(() => {
     suggestionsRef.current = suggestions
   }, [suggestions])
+
+  useEffect(() => {
+    selectedModelRef.current = selectedModel
+  }, [selectedModel])
+
+  useEffect(() => {
+    liveModelsRef.current = liveModels
+  }, [liveModels])
+
+  // Which models the server offers (and which have keys configured).
+  useEffect(() => {
+    if (!API_BASE) return
+    fetch(`${API_BASE}/api/live-models`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json) => {
+        if (json && Array.isArray(json.models) && json.models.length > 0 && mountedRef.current) {
+          setLiveModels(json.models)
+        }
+      })
+      .catch(() => {})
+  }, [])
 
   useEffect(() => {
     latestContextRef.current = {
@@ -507,15 +578,16 @@ function LiveCopilot() {
         matchQaEntriesSemantic(API_BASE, question, ctx.qaEntries, { queryEmbedding }),
         matchTrackKnowledgeSemantic(API_BASE, question, ctx.trackKnowledgeChunks, { rerank: false, queryEmbedding }),
       ])
-      // Fewer, better chunks: the whole prompt has to fit Groq's
-      // 8,000-tokens-per-minute free tier (see LIVE_CONTEXT_CAPS in
-      // providers.py), so send the top few rather than everything.
+      // How many chunks depends on the chosen model's budget (see
+      // LIVE_MATCHES above).
+      const modelKey = selectedModelRef.current
+      const budget = liveModelsRef.current.find((m) => m.key === modelKey)?.budget === 'roomy' ? 'roomy' : 'tight'
       const qaContext = matchedQa
-        .slice(0, LIVE_QA_MATCHES)
+        .slice(0, LIVE_MATCHES[budget].qa)
         .map((e) => `Q: ${e.question}\nA: ${e.answer}`)
         .join('\n\n')
       const knowledgeContext = matchedKnowledge
-        .slice(0, LIVE_KNOWLEDGE_MATCHES)
+        .slice(0, LIVE_MATCHES[budget].knowledge)
         .map((c) => c.chunk_text)
         .join('\n\n')
       // Read from the ref, not the `suggestions` state variable --
@@ -538,6 +610,7 @@ function LiveCopilot() {
           track_notes: ctx.selectedTrack?.notes || '',
           knowledge_context: knowledgeContext,
           conversation_history: conversationHistory,
+          model: modelKey,
         }),
       })
       if (!res.ok) throw new Error(`Server error ${res.status}`)
@@ -599,6 +672,11 @@ function LiveCopilot() {
   function flushCurrentBuffer() {
     const state = liveRef.current
     if (!state) return
+    if (state.dual) {
+      flushDualBuffer(state, 'interviewer')
+      flushDualBuffer(state, 'you')
+      return
+    }
     if (state.utteranceFlushTimer) {
       clearTimeout(state.utteranceFlushTimer)
       state.utteranceFlushTimer = null
@@ -629,6 +707,11 @@ function LiveCopilot() {
       // briefly followed by a "retrying" one -- both are informative,
       // neither needs suppressing.
       if (mountedRef.current) setError('Live listening stopped: ' + parsed.error)
+      return
+    }
+
+    if (state.dual) {
+      handleDualChannelMessage(state, parsed)
       return
     }
 
@@ -713,6 +796,74 @@ function LiveCopilot() {
     state.utteranceFlushTimer = setTimeout(() => flushCurrentBuffer(), UTTERANCE_FALLBACK_MS)
   }
 
+  // ---- "Interview on this laptop" (two-channel) mode ----
+  // Channel 0 = mic = you, channel 1 = captured tab = interviewer. Each
+  // person gets their own in-progress line and timer, since (unlike
+  // one shared mic) both inputs can carry speech at the same moment.
+  function flushDualBuffer(state, speaker) {
+    if (state.dualFlushTimers[speaker]) {
+      clearTimeout(state.dualFlushTimers[speaker])
+      state.dualFlushTimers[speaker] = null
+    }
+    const buf = state.dualBuffers[speaker]
+    state.dualBuffers[speaker] = null
+    if (speaker === 'interviewer' && mountedRef.current) setLiveLine(null)
+    if (buf && buf.trim()) appendCompletedTurn(speaker, buf.trim())
+  }
+
+  function armDualFlushTimer(state, speaker) {
+    if (state.dualFlushTimers[speaker]) clearTimeout(state.dualFlushTimers[speaker])
+    state.dualFlushTimers[speaker] = setTimeout(() => flushDualBuffer(state, speaker), UTTERANCE_FALLBACK_MS)
+  }
+
+  function rememberInterviewerSpeech(state, text) {
+    const now = Date.now()
+    state.recentInterviewerSpeech.push({ text, at: now })
+    state.recentInterviewerSpeech = state.recentInterviewerSpeech.filter((e) => now - e.at < ECHO_LOOKBACK_MS)
+  }
+
+  function handleDualChannelMessage(state, parsed) {
+    if (parsed.type === 'UtteranceEnd') {
+      if (parsed.last_word_end === -1) return
+      const channel = Array.isArray(parsed.channel) ? parsed.channel[0] : null
+      if (channel === 0) flushDualBuffer(state, 'you')
+      else if (channel === 1) flushDualBuffer(state, 'interviewer')
+      return
+    }
+    if (parsed.type !== 'Results') return
+    const transcript = parsed.channel?.alternatives?.[0]?.transcript
+    if (!transcript) return
+    const speaker = (parsed.channel_index?.[0] ?? 0) === 1 ? 'interviewer' : 'you'
+
+    if (speaker === 'interviewer') {
+      rememberInterviewerSpeech(state, transcript)
+      if (mountedRef.current) {
+        const confirmed = state.dualBuffers.interviewer ? state.dualBuffers.interviewer + ' ' : ''
+        setLiveLine({ speaker, text: confirmed + transcript, interim: !parsed.is_final })
+      }
+      if (parsed.is_final) {
+        state.dualBuffers.interviewer = (state.dualBuffers.interviewer ? state.dualBuffers.interviewer + ' ' : '') + transcript
+      }
+      if (state.dualBuffers.interviewer) armDualFlushTimer(state, 'interviewer')
+      return
+    }
+
+    // Mic channel (you). Interim results only keep the timer alive.
+    if (!parsed.is_final) {
+      if (state.dualBuffers.you) armDualFlushTimer(state, 'you')
+      return
+    }
+    // Without headphones the mic also hears the interviewer -- drop
+    // lines that are mostly a copy of what the tab just said.
+    const recent = state.recentInterviewerSpeech.map((e) => e.text).join(' ')
+    if (isLikelyEcho(transcript, recent)) return
+    // You started talking: the interviewer's question is done, so send
+    // it now instead of waiting out its silence timer.
+    if (state.dualBuffers.interviewer) flushDualBuffer(state, 'interviewer')
+    state.dualBuffers.you = (state.dualBuffers.you ? state.dualBuffers.you + ' ' : '') + transcript
+    armDualFlushTimer(state, 'you')
+  }
+
   async function startSession() {
     setError(null)
     setTurns([])
@@ -722,6 +873,48 @@ function LiveCopilot() {
     setReconnectAttempt(0)
     setStatus('preparing')
     openQuestionRef.current = null
+    const dual = inputMode === INPUT_MODES.SAME && CAN_CAPTURE_TAB_AUDIO
+
+    // "Interview on this laptop": capture the Meet/Zoom tab's sound
+    // FIRST -- Chrome only allows the share picker right after a click,
+    // so this must happen before any other waiting below.
+    let displayStream = null
+    if (dual) {
+      try {
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
+          // Chrome requires video to be requested; it's kept tiny and
+          // never used -- only the audio matters.
+          video: { displaySurface: 'browser', frameRate: 1, width: 320, height: 240 },
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            // keep hearing the interviewer yourself while it's captured
+            suppressLocalAudioPlayback: false,
+          },
+          preferCurrentTab: false,
+          selfBrowserSurface: 'exclude',
+          surfaceSwitching: 'include',
+          systemAudio: 'include',
+        })
+      } catch (err) {
+        setError(
+          err?.name === 'NotAllowedError'
+            ? 'Sharing was cancelled. Start again and pick the tab your interview is in.'
+            : 'Could not capture the interview tab: ' + err.message,
+        )
+        setStatus('idle')
+        return
+      }
+      if (displayStream.getAudioTracks().length === 0) {
+        displayStream.getTracks().forEach((t) => t.stop())
+        setError(
+          'No sound was shared. Start again, choose the "Chrome Tab" with your interview, and make sure "Also share tab audio" is switched on.',
+        )
+        setStatus('idle')
+        return
+      }
+    }
 
     let resumeText = ''
     let jdText = selectedTrack?.jd_text || ''
@@ -733,6 +926,7 @@ function LiveCopilot() {
     } catch (err) {
       setError(err.message)
       setStatus('idle')
+      displayStream?.getTracks().forEach((t) => t.stop())
       return
     }
 
@@ -745,17 +939,34 @@ function LiveCopilot() {
       // never hear the interviewer at all. Use your laptop's built-in
       // speakers (not headphones) for that setup so the mic can pick
       // up both voices; for an in-person interview this doesn't matter.
+      //
+      // In "interview on this laptop" mode the interviewer is captured
+      // straight from the tab instead, so the mic only needs YOU -- echo
+      // cancellation goes back ON to keep the speakers' sound out of it
+      // (headphones are still best; see isLikelyEcho for the backstop).
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true },
+        audio: { echoCancellation: dual, noiseSuppression: true, autoGainControl: true },
       })
     } catch (err) {
       setError('Mic error: ' + err.message)
       setStatus('idle')
+      displayStream?.getTracks().forEach((t) => t.stop())
       return
     }
 
     const state = {
       stream,
+      displayStream,
+      dual,
+      channels: dual ? 2 : 1,
+      // Two-channel mode: one in-progress line per person (they can
+      // overlap), each with its own safety-net timer -- see
+      // handleDualChannelMessage.
+      dualBuffers: { you: null, interviewer: null },
+      dualFlushTimers: { you: null, interviewer: null },
+      // Interviewer text heard in the last ECHO_LOOKBACK_MS -- what
+      // the echo filter compares the mic against.
+      recentInterviewerSpeech: [],
       sessionId: null,
       resumeText,
       jdText,
@@ -821,11 +1032,31 @@ function LiveCopilot() {
 
     try {
       const micCtx = new (window.AudioContext || window.webkitAudioContext)()
+      micCtx.resume().catch(() => {})
       const source = micCtx.createMediaStreamSource(stream)
-      const processor = micCtx.createScriptProcessor(4096, 1, 1)
+      const processor = micCtx.createScriptProcessor(4096, state.channels, 1)
       state.micCtx = micCtx
       state.source = source
       state.processor = processor
+
+      if (dual) {
+        // Mic -> channel 0 (you), captured tab -> channel 1 (the
+        // interviewer). The merger mixes each input down to mono.
+        const tabSource = micCtx.createMediaStreamSource(new MediaStream(displayStream.getAudioTracks()))
+        const merger = micCtx.createChannelMerger(2)
+        source.connect(merger, 0, 0)
+        tabSource.connect(merger, 0, 1)
+        state.tabSource = tabSource
+        state.merger = merger
+        // Chrome's "Stop sharing" bar, or the tab closing.
+        displayStream.getAudioTracks()[0].onended = () => {
+          if (liveRef.current === state && mountedRef.current) {
+            setError(
+              "The interview tab is no longer shared, so the interviewer can't be heard. End the session and start again to share it.",
+            )
+          }
+        }
+      }
 
       // Reads state.ws (not a captured local variable) so that when
       // connectWebSocket swaps in a fresh WebSocket after a reconnect,
@@ -833,14 +1064,20 @@ function LiveCopilot() {
       // torn down and rebuilt.
       processor.onaudioprocess = (e) => {
         if (state.paused) return
-        const input = e.inputBuffer.getChannelData(0)
+        // Downsample to 16kHz 16-bit; with 2 channels, samples are
+        // interleaved (mic, tab, mic, tab, ...) as Deepgram expects.
+        const channels = state.channels
+        const inputs = []
+        for (let c = 0; c < channels; c++) inputs.push(e.inputBuffer.getChannelData(c))
         const ratio = micCtx.sampleRate / 16000
-        const outLength = Math.floor(input.length / ratio)
-        const pcm16 = new Int16Array(outLength)
+        const outLength = Math.floor(inputs[0].length / ratio)
+        const pcm16 = new Int16Array(outLength * channels)
         for (let i = 0; i < outLength; i++) {
           const srcIndex = Math.floor(i * ratio)
-          let s = Math.max(-1, Math.min(1, input[srcIndex]))
-          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff
+          for (let c = 0; c < channels; c++) {
+            const s = Math.max(-1, Math.min(1, inputs[c][srcIndex]))
+            pcm16[i * channels + c] = s < 0 ? s * 0x8000 : s * 0x7fff
+          }
         }
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
           state.ws.send(pcm16.buffer)
@@ -852,7 +1089,8 @@ function LiveCopilot() {
           bufferAudioChunk(state, pcm16.buffer)
         }
       }
-      source.connect(processor)
+      if (dual) state.merger.connect(processor)
+      else source.connect(processor)
       processor.connect(micCtx.destination)
     } catch (err) {
       setError('Connect error: ' + err.message)
@@ -867,6 +1105,7 @@ function LiveCopilot() {
       }
       try {
         stream.getTracks().forEach((t) => t.stop())
+        displayStream?.getTracks().forEach((t) => t.stop())
       } catch (e) {
         /* ignore */
       }
@@ -885,7 +1124,7 @@ function LiveCopilot() {
   function connectWebSocket(state, isReconnect) {
     let ws
     try {
-      ws = new WebSocket(`${WS_BASE}/ws/live-copilot-stream`)
+      ws = new WebSocket(`${WS_BASE}/ws/live-copilot-stream${state.dual ? '?mode=dual' : ''}`)
     } catch (err) {
       scheduleReconnect(state)
       return
@@ -901,6 +1140,10 @@ function LiveCopilot() {
           setConnectionState('connected')
           setReconnectAttempt(0)
         }
+      } else if (state.dual) {
+        // Speakers are known from the input channel -- no calibration.
+        state.calibrating = false
+        setStatus('live')
       } else {
         setStatus('calibrating')
         state.calibrationTimer = setTimeout(finishCalibration, CALIBRATION_MS)
@@ -1043,6 +1286,14 @@ function LiveCopilot() {
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
     flushCurrentBuffer()
     openQuestionRef.current = null
+    if (state.dualFlushTimers) {
+      Object.values(state.dualFlushTimers).forEach((t) => t && clearTimeout(t))
+    }
+    try {
+      state.displayStream?.getTracks().forEach((t) => t.stop())
+    } catch {
+      /* ignore */
+    }
     try {
       state.ws && state.ws.close()
     } catch (e) {
@@ -1146,6 +1397,60 @@ function LiveCopilot() {
               ))}
             </select>
           </label>
+          <fieldset className="copilot-setup">
+            <legend>Where is the interview?</legend>
+            {CAN_CAPTURE_TAB_AUDIO && (
+              <label>
+                <input
+                  type="radio"
+                  name="inputMode"
+                  checked={inputMode === INPUT_MODES.SAME}
+                  onChange={() => {
+                    setInputMode(INPUT_MODES.SAME)
+                    savePref('liveCopilot.inputMode', INPUT_MODES.SAME)
+                  }}
+                />{' '}
+                <strong>On this laptop</strong> (Google Meet / Zoom / Teams in Chrome)
+                <span className="copilot-setup-hint">
+                  After you click Start, pick the interview's Chrome tab and keep "Also share tab audio"
+                  switched on. Your mic = you, the tab = the interviewer, so no voice check is needed.
+                  Wear headphones if you can.
+                </span>
+              </label>
+            )}
+            <label>
+              <input
+                type="radio"
+                name="inputMode"
+                checked={inputMode === INPUT_MODES.OTHER}
+                onChange={() => {
+                  setInputMode(INPUT_MODES.OTHER)
+                  savePref('liveCopilot.inputMode', INPUT_MODES.OTHER)
+                }}
+              />{' '}
+              <strong>On another device, or in person</strong>
+              <span className="copilot-setup-hint">
+                One mic hears both of you. Starts with a short "say a sentence" step to learn your voice.
+              </span>
+            </label>
+          </fieldset>
+          <label className="auth-form" style={{ maxWidth: 420 }}>
+            AI model
+            <select
+              value={selectedModel}
+              onChange={(e) => {
+                setSelectedModel(e.target.value)
+                savePref('liveCopilot.model', e.target.value)
+              }}
+            >
+              {liveModels.map((m) => (
+                <option key={m.key} value={m.key} disabled={!m.available}>
+                  {m.label}
+                  {m.available ? '' : ' (not set up)'}
+                </option>
+              ))}
+            </select>
+          </label>
           <p>
             <button type="button" onClick={startSession}>
               Start Listening
@@ -1169,12 +1474,33 @@ function LiveCopilot() {
           <button type="button" onClick={togglePause}>
             {paused ? 'Resume' : 'Pause'}
           </button>{' '}
-          <button type="button" onClick={swapSpeakers}>
-            Swap Speakers
-          </button>{' '}
-          <button type="button" onClick={recalibrate}>
-            Recalibrate
-          </button>{' '}
+          {/* Not needed when the interviewer comes from the shared tab. */}
+          {!liveRef.current?.dual && (
+            <>
+              <button type="button" onClick={swapSpeakers}>
+                Swap Speakers
+              </button>{' '}
+              <button type="button" onClick={recalibrate}>
+                Recalibrate
+              </button>{' '}
+            </>
+          )}
+          {/* Switch model mid-interview -- applies to the next question. */}
+          <select
+            className="copilot-model-select"
+            aria-label="AI model"
+            value={selectedModel}
+            onChange={(e) => {
+              setSelectedModel(e.target.value)
+              savePref('liveCopilot.model', e.target.value)
+            }}
+          >
+            {liveModels.map((m) => (
+              <option key={m.key} value={m.key} disabled={!m.available}>
+                {m.label}
+              </option>
+            ))}
+          </select>{' '}
           <button type="button" onClick={handleEndSession}>
             End Session
           </button>

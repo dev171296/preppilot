@@ -28,6 +28,7 @@ from providers import (
     score_interview_answer,
     score_interview_session_summary,
     stream_live_suggestion_chunks,
+    list_live_models,
     embed_text,
     rerank_chunks,
 )
@@ -141,17 +142,24 @@ async def ws_stt_stream(websocket: WebSocket, provider_key: str, language: str |
 
 
 @app.websocket("/ws/live-copilot-stream")
-async def ws_live_copilot_stream(websocket: WebSocket, language: str | None = None):
+async def ws_live_copilot_stream(websocket: WebSocket, language: str | None = None, mode: str | None = None):
     """
     Same Deepgram relay as /ws/stt-stream above, but with diarize=true
     -- this is what tells apart the (real) interviewer's voice from
     the candidate's in Live Copilot, both coming from one mic. See
     stream_deepgram_stt's docstring for how the browser resolves which
     speaker number is "you".
+
+    mode=dual (3 Nov): "interview is on this laptop" -- the browser
+    sends 2-channel audio (mic + captured Meet tab) and each channel's
+    speaker is known, so diarization is skipped.
     """
     await websocket.accept()
     try:
-        await stream_deepgram_stt(websocket, language, diarize=True)
+        if mode == "dual":
+            await stream_deepgram_stt(websocket, language, dual_channel=True)
+        else:
+            await stream_deepgram_stt(websocket, language, diarize=True)
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -297,6 +305,9 @@ class LiveSuggestionRequest(BaseModel):
     # (Live Copilot since 2 Nov). Lets a follow-up like "and if I missed the deadline?" actually be
     # answered as a follow-up instead of a context-free fresh question.
     conversation_history: list[dict] = []
+    # Which LIVE_MODELS entry to use (see providers.py); unknown/empty
+    # falls back to the default model.
+    model: str = ""
 
 
 @app.post("/api/live-suggestion")
@@ -328,9 +339,16 @@ def api_live_suggestion(payload: LiveSuggestionRequest):
                 "knowledge_context": payload.knowledge_context,
             },
             conversation_history=payload.conversation_history,
+            model_key=payload.model,
         ),
         media_type="text/plain",
     )
+
+
+@app.get("/api/live-models")
+def api_live_models():
+    """Models offered in Live Copilot's model dropdown."""
+    return {"models": list_live_models()}
 
 
 class EmbedTextRequest(BaseModel):

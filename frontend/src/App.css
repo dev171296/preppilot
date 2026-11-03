@@ -243,6 +243,38 @@ button:disabled {
   font-size: 0.85rem;
 }
 
+.copilot-setup {
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.8rem 0;
+  max-width: 560px;
+}
+
+.copilot-setup legend {
+  padding: 0 0.3rem;
+  font-weight: 600;
+}
+
+.copilot-setup label {
+  display: block;
+  margin: 0.4rem 0;
+  cursor: pointer;
+}
+
+.copilot-setup-hint {
+  display: block;
+  margin-left: 1.5rem;
+  font-size: 0.82rem;
+  color: #94a3b8;
+}
+
+.copilot-model-select {
+  font-size: 0.85rem;
+  padding: 0.25rem;
+  max-width: 100%;
+}
+
 .copilot-hearing {
   /* fixed single line so nothing below moves while the interviewer talks */
   height: 1.4em;

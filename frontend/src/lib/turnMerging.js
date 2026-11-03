@@ -47,17 +47,18 @@ export function isWorthASuggestion(text) {
 
 export const SUGGESTION_ERROR_MARKER = '[LIVE_SUGGESTION_ERROR:'
 
-// Groq's 429 message says e.g. "Please try again in 7.66s" or
-// "try again in 1m2.5s". Returns whole seconds to wait, or null.
+// Rate-limit messages say e.g. "Please try again in 7.66s" / "try
+// again in 1m2.5s" (Groq) or "Please retry in 12.3s" (Gemini).
+// Returns whole seconds to wait, or null.
 export function parseRetryAfterSeconds(message) {
-  const m = /try again in (?:(\d+)m)?([\d.]+)s/i.exec(message || '')
+  const m = /(?:try again|retry) in (?:(\d+)m)?([\d.]+)s/i.exec(message || '')
   if (!m) return null
   const minutes = m[1] ? parseInt(m[1], 10) : 0
   return Math.ceil(minutes * 60 + parseFloat(m[2]))
 }
 
 export function isRateLimitError(message) {
-  return /rate.?limit|429/i.test(message || '')
+  return /rate.?limit|429|resource.?exhausted|quota/i.test(message || '')
 }
 
 // Splits the backend's raw reply into {text, error}. The backend
@@ -73,8 +74,24 @@ export function splitSuggestionError(fullText) {
 // A short, readable version of an error for the suggestion card.
 export function friendlySuggestionError(raw) {
   if (isRateLimitError(raw)) {
-    return 'Groq rate limit reached (free tier allows ~8,000 tokens per minute).'
+    return 'This model\'s free per-minute limit was reached — switching to another model in the dropdown also works.'
   }
   const s = String(raw || 'Unknown error')
   return s.length > 160 ? s.slice(0, 160) + '…' : s
+}
+
+// "Interview on this laptop" mode without headphones: the mic also
+// hears the interviewer through the speakers, so the mic channel can
+// produce a (garbled) copy of what the Meet tab channel just said.
+// True when most of the mic text's words were just said by the
+// interviewer -- such a line is dropped instead of being shown as the
+// candidate speaking (which would also wrongly "close" the question).
+export const ECHO_WORD_OVERLAP = 0.6
+export function isLikelyEcho(micText, recentInterviewerText) {
+  const micWords = (micText || '').toLowerCase().match(/[\p{L}\p{N}']+/gu) || []
+  if (micWords.length < 2) return false
+  const heard = new Set((recentInterviewerText || '').toLowerCase().match(/[\p{L}\p{N}']+/gu) || [])
+  if (heard.size === 0) return false
+  const overlap = micWords.filter((w) => heard.has(w)).length / micWords.length
+  return overlap >= ECHO_WORD_OVERLAP
 }

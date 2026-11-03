@@ -375,10 +375,106 @@ LIVE_CONTEXT_CAPS = {
     "knowledge_context": 4000,
     "qa_context": 1500,
 }
+# Gemini and NVIDIA's free tiers aren't squeezed by an 8K tokens/minute
+# cap the way Groq's is, so models marked budget="roomy" below get more
+# background text (better-grounded answers).
+LIVE_CONTEXT_CAPS_ROOMY = {
+    "jd_text": 3000,
+    "resume_text": 3000,
+    "profile_summary": 2000,
+    "track_notes": 2500,
+    "knowledge_context": 9000,
+    "qa_context": 3000,
+}
 LIVE_MAX_COMPLETION_TOKENS = 1024
 
+# Models selectable in Live Copilot (3 Nov, Devanshu's request). Each
+# key is what the frontend sends as `model`. IDs are the same ones the
+# Settings > provider test already uses (checked against each
+# provider's docs/catalogue, see PROVIDERS above). Thinking/reasoning
+# is turned down to the minimum each provider allows -- a live
+# interview needs the first words fast, not deep deliberation:
+#   - Groq gpt-oss: reasoning_effort "low" (console.groq.com/docs/reasoning)
+#   - Gemini 3.x: thinking_level "minimal" (Flash-Lite) / "low" (Flash) --
+#     the lowest each supports (ai.google.dev/gemini-api/docs/thinking)
+#   - Nemotron: chat_template_kwargs.enable_thinking=false (NVIDIA NIM docs)
+LIVE_MODELS = {
+    "groq-gpt-oss-120b": {
+        "label": "Groq · GPT-OSS 120B (default)",
+        "kind": "openai_compatible",
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "model": "openai/gpt-oss-120b",
+        "extra_body": {"reasoning_effort": "low", "max_completion_tokens": LIVE_MAX_COMPLETION_TOKENS},
+        "budget": "tight",
+    },
+    "groq-gpt-oss-20b": {
+        "label": "Groq · GPT-OSS 20B (faster)",
+        "kind": "openai_compatible",
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "model": "openai/gpt-oss-20b",
+        "extra_body": {"reasoning_effort": "low", "max_completion_tokens": LIVE_MAX_COMPLETION_TOKENS},
+        "budget": "tight",
+    },
+    "gemini-3.5-flash-lite": {
+        "label": "Gemini 3.5 Flash-Lite (fastest Google)",
+        "kind": "gemini",
+        "api_key_env": "GEMINI_API_KEY",
+        "model": "gemini-3.5-flash-lite",
+        "thinking_level": "MINIMAL",
+        "budget": "roomy",
+    },
+    "gemini-3.8-flash": {
+        "label": "Gemini 3.8 Flash (smartest Google Flash)",
+        "kind": "gemini",
+        "api_key_env": "GEMINI_API_KEY",
+        "model": "gemini-3.8-flash",
+        "thinking_level": "LOW",
+        "budget": "roomy",
+    },
+    "nvidia-nemotron-3.5-lightning": {
+        "label": "NVIDIA · Nemotron 3.5 Lightning",
+        "kind": "openai_compatible",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "api_key_env": "NVIDIA_API_KEY",
+        "model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}, "max_tokens": LIVE_MAX_COMPLETION_TOKENS},
+        "budget": "roomy",
+    },
+    "nvidia-deepseek-v4.1-flash": {
+        "label": "NVIDIA · DeepSeek V4.1 Flash",
+        "kind": "openai_compatible",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "api_key_env": "NVIDIA_API_KEY",
+        "model": "deepseek-ai/deepseek-v4.1-flash",
+        "extra_body": {"max_tokens": LIVE_MAX_COMPLETION_TOKENS},
+        "budget": "roomy",
+    },
+}
+DEFAULT_LIVE_MODEL = "groq-gpt-oss-120b"
 
-def stream_live_suggestion_chunks(question: str, context: dict, conversation_history: list[dict] | None = None):
+
+def list_live_models() -> list[dict]:
+    """For the Live Copilot model dropdown. A model whose API key isn't
+    configured on the server is still listed, but marked unavailable."""
+    return [
+        {
+            "key": key,
+            "label": m["label"],
+            "budget": m["budget"],
+            "available": bool(os.environ.get(m["api_key_env"])),
+        }
+        for key, m in LIVE_MODELS.items()
+    ]
+
+
+def stream_live_suggestion_chunks(
+    question: str,
+    context: dict,
+    conversation_history: list[dict] | None = None,
+    model_key: str | None = None,
+):
     """
     Same job as before (a couple of quick bullet points + one
     ready-to-say answer for whatever the interviewer just asked), but
@@ -406,26 +502,29 @@ def stream_live_suggestion_chunks(question: str, context: dict, conversation_his
     # Loosely-worded inline context is easy for a model to skim past;
     # clearly delimited sections plus an explicit instruction in the
     # system prompt to use ALL of them is a much stronger signal.
+    live_model = LIVE_MODELS.get(model_key or "", LIVE_MODELS[DEFAULT_LIVE_MODEL])
+    caps = LIVE_CONTEXT_CAPS_ROOMY if live_model["budget"] == "roomy" else LIVE_CONTEXT_CAPS
+
     context_lines = []
     role = context.get("role_title") or ""
     company = context.get("company_name") or ""
     if role or company:
         context_lines.append("### ROLE ###\n" + f"Role: {role}" + (f" at {company}" if company else ""))
     if context.get("jd_text"):
-        context_lines.append("### JOB DESCRIPTION ###\n" + context["jd_text"][: LIVE_CONTEXT_CAPS["jd_text"]])
+        context_lines.append("### JOB DESCRIPTION ###\n" + context["jd_text"][: caps["jd_text"]])
     if context.get("resume_text"):
-        context_lines.append("### CANDIDATE RESUME ###\n" + context["resume_text"][: LIVE_CONTEXT_CAPS["resume_text"]])
+        context_lines.append("### CANDIDATE RESUME ###\n" + context["resume_text"][: caps["resume_text"]])
     if context.get("profile_summary"):
         # General bio from the Profile screen -- not tied to any one
         # company/role, same text Mock Interview's system instruction
         # already uses.
-        context_lines.append("### ABOUT THE CANDIDATE (general) ###\n" + context["profile_summary"][: LIVE_CONTEXT_CAPS["profile_summary"]])
+        context_lines.append("### ABOUT THE CANDIDATE (general) ###\n" + context["profile_summary"][: caps["profile_summary"]])
     if context.get("track_notes"):
         # Free-text notes the candidate wrote specifically for THIS
         # Track (company/role) -- things that don't belong in the
         # general Profile summary or the JD itself.
         context_lines.append(
-            "### CANDIDATE'S OWN NOTES FOR THIS SPECIFIC COMPANY/ROLE ###\n" + context["track_notes"][: LIVE_CONTEXT_CAPS["track_notes"]]
+            "### CANDIDATE'S OWN NOTES FOR THIS SPECIFIC COMPANY/ROLE ###\n" + context["track_notes"][: caps["track_notes"]]
         )
     if context.get("knowledge_context"):
         # The frontend already ran a two-stage retrieval over this
@@ -440,7 +539,7 @@ def stream_live_suggestion_chunks(question: str, context: dict, conversation_his
         # under normal use.
         context_lines.append(
             "### RELEVANT BACKGROUND/REFERENCE MATERIAL FOR THIS COMPANY/ROLE ###\n"
-            + context["knowledge_context"][: LIVE_CONTEXT_CAPS["knowledge_context"]]
+            + context["knowledge_context"][: caps["knowledge_context"]]
         )
     if context.get("qa_context"):
         # Pre-matched (on the frontend, by semantic search against
@@ -449,7 +548,7 @@ def stream_live_suggestion_chunks(question: str, context: dict, conversation_his
         # last client" that don't belong on any one Track.
         context_lines.append(
             "### CANDIDATE'S OWN PRE-WRITTEN ANSWERS (use verbatim/near-verbatim if one matches) ###\n"
-            + context["qa_context"][: LIVE_CONTEXT_CAPS["qa_context"]]
+            + context["qa_context"][: caps["qa_context"]]
         )
     context_block = "\n\n".join(context_lines)
 
@@ -507,37 +606,69 @@ def stream_live_suggestion_chunks(question: str, context: dict, conversation_his
     messages.append({"role": "user", "content": user_prompt})
 
     try:
-        # max_retries=0: the OpenAI client otherwise silently RETRIES a
-        # 429 (rate limit) after sleeping for Groq's "try again in Ns"
-        # -- up to ~1-2 minutes with no bytes sent, long enough for the
-        # browser/proxy to drop the connection, which showed up as an
-        # EMPTY suggestion card with no error. Failing fast instead
-        # returns a clear error the frontend can show and auto-retry.
-        client = OpenAI(
-            api_key=os.environ["GROQ_API_KEY"],
-            base_url="https://api.groq.com/openai/v1",
-            timeout=REQUEST_TIMEOUT_S,
-            max_retries=0,
-        )
-        stream = client.chat.completions.create(
-            model=SCORING_MODEL,
-            messages=messages,
-            stream=True,
-            # gpt-oss is a reasoning model; "low" effort (documented for
-            # GPT-OSS at console.groq.com/docs/reasoning) cuts both the
-            # hidden thinking time before the first word AND the tokens
-            # it burns from the 8K/minute budget.
-            reasoning_effort="low",
-            max_completion_tokens=LIVE_MAX_COMPLETION_TOKENS,
-        )
-        for chunk in stream:
-            if not chunk.choices:
-                continue
-            piece = chunk.choices[0].delta.content
-            if piece:
-                yield piece
+        if live_model["kind"] == "gemini":
+            yield from _stream_gemini_live_suggestion(live_model, system_prompt, messages[1:])
+        else:
+            yield from _stream_openai_compatible_live_suggestion(live_model, messages)
     except Exception as e:
         yield f"\n[LIVE_SUGGESTION_ERROR: {type(e).__name__}: {e}]"
+
+
+def _stream_openai_compatible_live_suggestion(live_model: dict, messages: list[dict]):
+    # max_retries=0: the OpenAI client otherwise silently RETRIES a 429
+    # (rate limit) after sleeping for the provider's "try again in Ns"
+    # -- up to ~1-2 minutes with no bytes sent, long enough for the
+    # browser/proxy to drop the connection, which showed up as an EMPTY
+    # suggestion card with no error. Failing fast instead returns a
+    # clear error the frontend can show and auto-retry.
+    client = OpenAI(
+        api_key=os.environ[live_model["api_key_env"]],
+        base_url=live_model["base_url"],
+        timeout=REQUEST_TIMEOUT_S,
+        max_retries=0,
+    )
+    stream = client.chat.completions.create(
+        model=live_model["model"],
+        messages=messages,
+        stream=True,
+        extra_body=live_model.get("extra_body") or None,
+    )
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        # Only the answer itself (delta.content) -- any reasoning a
+        # model streams separately is skipped.
+        piece = chunk.choices[0].delta.content
+        if piece:
+            yield piece
+
+
+def _stream_gemini_live_suggestion(live_model: dict, system_prompt: str, chat_messages: list[dict]):
+    client = genai.Client(
+        api_key=os.environ[live_model["api_key_env"]],
+        http_options=genai_types.HttpOptions(timeout=REQUEST_TIMEOUT_S * 1000),
+    )
+    contents = [
+        genai_types.Content(
+            role="model" if m["role"] == "assistant" else "user",
+            parts=[genai_types.Part(text=m["content"])],
+        )
+        for m in chat_messages
+    ]
+    config = genai_types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        # Gemini counts its (minimal) thinking inside this too, so a bit
+        # more headroom than the other providers' answer-only cap.
+        max_output_tokens=LIVE_MAX_COMPLETION_TOKENS * 2,
+        thinking_config=genai_types.ThinkingConfig(
+            thinking_level=getattr(genai_types.ThinkingLevel, live_model["thinking_level"]),
+        ),
+    )
+    for chunk in client.models.generate_content_stream(
+        model=live_model["model"], contents=contents, config=config
+    ):
+        if chunk.text:
+            yield chunk.text
 
 
 # How many cosine-shortlisted candidates we'll ever send to the
@@ -920,7 +1051,9 @@ DEEPGRAM_MODEL = "nova-3"
 UTTERANCE_END_MS = 1500
 
 
-async def stream_deepgram_stt(browser_ws, language: str | None = None, diarize: bool = False) -> None:
+async def stream_deepgram_stt(
+    browser_ws, language: str | None = None, diarize: bool = False, dual_channel: bool = False
+) -> None:
     """
     Relays raw 16kHz mono PCM16 audio from the browser (browser_ws, a
     FastAPI WebSocket already accept()-ed by the caller) straight
@@ -965,7 +1098,19 @@ async def stream_deepgram_stt(browser_ws, language: str | None = None, diarize: 
         f"?encoding=linear16&sample_rate=16000&model={DEEPGRAM_MODEL}"
         f"&interim_results=true&endpointing=300"
     )
-    if diarize:
+    if dual_channel:
+        # Live Copilot, "interview is on this laptop" mode (3 Nov): the
+        # browser sends interleaved 2-channel audio -- channel 0 = the
+        # candidate's mic, channel 1 = the captured Meet/Chrome tab
+        # (the interviewer). Deepgram transcribes each channel on its
+        # own and tags every result with channel_index (and every
+        # UtteranceEnd with channel), so WHO said it comes from which
+        # input it arrived on -- no voice diarization guesswork, no
+        # calibration. Same multilingual + 1.5s settings as below.
+        url += "&channels=2&multichannel=true"
+        url += "&language=multi&language_hint=en&language_hint=hi"
+        url += f"&utterance_end_ms={UTTERANCE_END_MS}"
+    elif diarize:
         # Live Copilot (2 Nov fix): Devanshu has NO control over which
         # language the real interviewer speaks -- English, Hindi, or
         # Hinglish (code-switched) -- and the frontend has no language
