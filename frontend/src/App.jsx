@@ -5,6 +5,7 @@ import Tracks from './pages/Tracks.jsx'
 import Settings from './pages/Settings.jsx'
 import MockInterview from './pages/MockInterview.jsx'
 import LiveCopilot from './pages/LiveCopilot.jsx'
+import History from './pages/History.jsx'
 import { useAuth } from './lib/AuthContext.jsx'
 import { ADMIN_EMAILS } from './lib/admin.js'
 import RenderStatusBanner from './components/RenderStatusBanner.jsx'
@@ -37,6 +38,7 @@ function App() {
           {isAdmin && <NavLink to="/settings">Settings</NavLink>}
           {session && <NavLink to="/mock-interview">Mock Interview</NavLink>}
           {session && <NavLink to="/live-copilot">Live Copilot</NavLink>}
+          {session && <NavLink to="/history">History</NavLink>}
           {session && (
             <button type="button" className="link-button" onClick={signOut}>
               Log out
@@ -53,6 +55,7 @@ function App() {
           <Route path="/settings" element={<Settings />} />
           <Route path="/mock-interview" element={<MockInterview />} />
           <Route path="/live-copilot" element={<LiveCopilot />} />
+          <Route path="/history" element={<History />} />
         </Routes>
       </main>
 

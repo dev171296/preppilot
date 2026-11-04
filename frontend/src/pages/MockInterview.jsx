@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
 
@@ -273,7 +274,7 @@ function MockInterview() {
     }
 
     if (!mountedRef.current) return
-    setSessionReport({ overallScore, overallSummary })
+    setSessionReport({ overallScore, overallSummary, sessionId: sid || null })
     setStatus('ended')
   }
 
@@ -598,6 +599,11 @@ function MockInterview() {
       {status === 'ended' && sessionReport && (
         <div>
           <h2>Session Report</h2>
+          {sessionReport.sessionId && (
+            <p>
+              <Link to={`/history?session=mock:${sessionReport.sessionId}`}>View this session in History</Link>
+            </p>
+          )}
           <p>
             <strong>Overall score:</strong>{' '}
             {sessionReport.overallScore !== null ? `${sessionReport.overallScore}/10` : 'Not enough scored answers'}

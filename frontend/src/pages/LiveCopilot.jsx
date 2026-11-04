@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient.js'
 import { useAuth } from '../lib/AuthContext.jsx'
 import {
@@ -219,6 +220,8 @@ function LiveCopilot() {
   // speaker change/UtteranceEnd to flush the whole turn to `turns`
   // below -- so the transcript appears live instead of all at once.
   const [liveLine, setLiveLine] = useState(null) // {speaker, text}
+  // The session just ended, for the "View full transcript" link.
+  const [lastSessionId, setLastSessionId] = useState(null)
   const [inputMode, setInputMode] = useState(() =>
     CAN_CAPTURE_TAB_AUDIO ? loadPref('liveCopilot.inputMode', INPUT_MODES.OTHER) : INPUT_MODES.OTHER,
   )
@@ -1331,6 +1334,7 @@ function LiveCopilot() {
 
   async function handleEndSession() {
     const sid = liveRef.current?.sessionId
+    setLastSessionId(sid || null)
     stopSession()
     setPaused(false)
     if (sid) {
@@ -1587,6 +1591,12 @@ function LiveCopilot() {
           <button type="button" onClick={handleStartAnother}>
             Start another session
           </button>
+          {lastSessionId && (
+            <>
+              {' '}
+              <Link to={`/history?session=live:${lastSessionId}`}>View full transcript</Link>
+            </>
+          )}
         </p>
       )}
     </section>
